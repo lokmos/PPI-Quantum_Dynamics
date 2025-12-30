@@ -80,8 +80,12 @@ Ulist = [0.1]
 # List of interaction strengths
 J = 0.5                         # Nearest-neighbour hopping amplitude
 cutoff = J*10**(-4)             # Cutoff for the off-diagonal elements to be considered zero
-dis = [1.0*i for i in range(1,7)]    
-#dis = [float(sys.argv[4])]                
+# By default, use the CLI disorder strength (matches main_itc_cpu.py behavior).
+# If you want to sweep d=1..6, set PYFLOW_SWEEP_D=1.
+if os.environ.get("PYFLOW_SWEEP_D", "0") in ("1", "true", "True"):
+    dis = [1.0 * i for i in range(1, 7)]
+else:
+    dis = [float(sys.argv[4])]
 order = 4                       # Order of terms to keep in running Hamiltonian (PROTOTYPE FEATURE)
 # List of disorder strengths
 lmax =  1000                     # Flow time max

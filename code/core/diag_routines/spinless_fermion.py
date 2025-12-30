@@ -27,7 +27,7 @@ and numerically integrate the flow equation to obtain a diagonal Hamiltonian.
 
 """
 
-import os,functools
+import os,functools,time
 from psutil import cpu_count
 # Set up threading options for parallel solver
 os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False)))       # Set number of OpenMP threads to run in parallel
@@ -1970,14 +1970,33 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     if order == 6:
         c5 = jnp.zeros((n,n,n,n,n),dtype=jnp.float64)
 
-    random_unitary = True
+    # Scrambling uses additional odeint calls and can dominate runtime for small n.
+    # Keep default behavior (enabled), but allow disabling for profiling/memory tests.
+    random_unitary = os.environ.get("PYFLOW_SCRAMBLE", "1") in ("1", "true", "True")
     res_cut = 0.5
     sctime = 0.
+
+    # Optional tuning: odeint tolerances (defaults keep original behavior).
+    try:
+        _rtol = float(os.environ.get("PYFLOW_ODE_RTOL", "1e-8"))
+    except Exception:
+        _rtol = 1e-8
+    try:
+        _atol = float(os.environ.get("PYFLOW_ODE_ATOL", "1e-8"))
+    except Exception:
+        _atol = 1e-8
+
+    # Optional timing summary
+    timelog = os.environ.get("PYFLOW_TIMELOG", "0") in ("1", "true", "True")
+    t_scramble = 0.0
+    t_flow = 0.0
+    t_scramble_extra = 0.0
 
     J0list = jnp.zeros(50,dtype=jnp.float32)
     J2list = jnp.zeros(50,dtype=jnp.float32)
 
     if random_unitary == True:
+        _t0 = time.perf_counter()
         count = 0
         _,V0,_,Vint = extract_diag(sol2,sol4)
         J00 = jnp.max(jnp.abs(V0))
@@ -1990,13 +2009,13 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
                 break
             dm_list = jnp.linspace(0,1.,5,endpoint=True)
             if order == 4:
-                soln = ode(int_ode_random_O4,[sol2,sol4,c1,c3],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=1e-8,atol=1e-8)
+                soln = ode(int_ode_random_O4,[sol2,sol4,c1,c3],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=_rtol,atol=_atol)
                 sol2,sol4,c1,c3 = soln[0][-1],soln[1][-1],soln[2][-1],soln[3][-1]
                 if jnp.max(jnp.abs(sol4))>0.25:
                     print('POTENTIAL CONVERGENCE ERROR')
                     break
             elif order == 6:
-                soln = ode(int_ode_random_O6,[sol2,sol4,c1,c3,sol6,c5],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=1e-8,atol=1e-8)
+                soln = ode(int_ode_random_O6,[sol2,sol4,c1,c3,sol6,c5],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=_rtol,atol=_atol)
                 sol2,sol4,c1,c3,sol6,c5 = soln[0][-1],soln[1][-1],soln[2][-1],soln[3][-1],soln[4][-1],soln[5][-1]
                 if jnp.max(jnp.abs(sol4))>0.25:
                     print('POTENTIAL CONVERGENCE ERROR')
@@ -2021,6 +2040,7 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
             print('Max LIOM terms: ',jnp.max(jnp.abs(c1)),jnp.max(jnp.abs(c3)))
         elif order == 6:
             print('Max LIOM terms: ',jnp.max(jnp.abs(c1)),jnp.max(jnp.abs(c3)),jnp.max(jnp.abs(c5)))
+        t_scramble += time.perf_counter() - _t0
 
     #print(np.round(np.array(sol2),3))
     #print('SOL4',np.sort(sol4.reshape(n**4))[-10::])
@@ -2034,6 +2054,15 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     n1 = 0.
     n2 = 0.
     sctime = 0
+
+    # Ensure J0/J2 are defined even when scrambling is disabled.
+    # (Previously they were only set inside the random_unitary branch.)
+    _, V0, _, Vint = extract_diag(sol2, sol4)
+    J0 = jnp.max(jnp.abs(V0))
+    J2 = jnp.max(jnp.abs(Vint))
+    J0list = J0list.at[k % len(J0list)].set(J0)
+    J2list = J2list.at[k % len(J2list)].set(J2)
+
     _memlog("flow_int_fl:init", step=0, l=0.0, n=int(n), qmax=int(qmax), order=int(order), dim=int(dim))
     while k < len(dl_list)-1 and (J0 > cutoff or J2 > 1e-3):
         # Periodic memory sampling (RSS) to build a memory-vs-step trace.
@@ -2054,12 +2083,14 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
             print('V0 break',J0,jnp.max(jnp.abs(V0)),jnp.median(jnp.abs(V0[V0 != 0])))
             break
 
+        _t0 = time.perf_counter()
         if order == 4:
-            soln = ode(int_ode_ladder,[sol2,sol4,c1,c3,0.,0.],dl_list[k-1:k+1],rtol=1e-8,atol=1e-8)
+            soln = ode(int_ode_ladder,[sol2,sol4,c1,c3,0.,0.],dl_list[k-1:k+1],rtol=_rtol,atol=_atol)
             sol2,sol4,c1,c3,n1,n2 = soln[0][-1],soln[1][-1],soln[2][-1],soln[3][-1],soln[4][-1],soln[5][-1]
         elif order == 6:
-            soln = ode(int_ode_ladder,[sol2,sol4,sol6,c1,c3,c5,0.,0.],dl_list[k-1:k+1],rtol=1e-8,atol=1e-8)
+            soln = ode(int_ode_ladder,[sol2,sol4,sol6,c1,c3,c5,0.,0.],dl_list[k-1:k+1],rtol=_rtol,atol=_atol)
             sol2,sol4,sol6,c1,c3,c5,n1,n2 = soln[0][-1],soln[1][-1],soln[2][-1],soln[3][-1],soln[4][-1],soln[5][-1],soln[6][-1],soln[7][-1]
+        t_flow += time.perf_counter() - _t0
 
         # print(np.where(np.abs(np.array(c3)) == np.abs(np.array(c3)).max()))
         # i1,j1,k1 = np.where(np.abs(np.array(c3)) == np.abs(np.array(c3)).max())
@@ -2101,7 +2132,7 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
 
         # print(k,int(jnp.round(jnp.mean(J0list)*1e4)),int(jnp.round(J0*1e4)),int(jnp.round(jnp.mean(J0list)*1e4)) == int(jnp.round(J0*1e4)))
         #sctime = 0
-        if (k > len(dl_list)//2 and k%50==0 and int(jnp.round(jnp.mean(J0list)*1e4)) == int(jnp.round(J0*1e4)) and J0 > 1e-3) or (jnp.max(jnp.abs(c3))>0.15 and J0 > 1e-3):
+        if random_unitary and ((k > len(dl_list)//2 and k%50==0 and int(jnp.round(jnp.mean(J0list)*1e4)) == int(jnp.round(J0*1e4)) and J0 > 1e-3) or (jnp.max(jnp.abs(c3))>0.15 and J0 > 1e-3)):
             # if k > len(dl_list)//2:
             res_cut = 0.5
             reslist = res(n,sol2,res_cut,cutoff=cutoff)
@@ -2109,17 +2140,19 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
                 reslist = res(n,sol2,res_cut,cutoff=0.25*cutoff)
                 sctime += 1
             while len(reslist)>0:
+                _t1 = time.perf_counter()
                 print('*** SCRAMBLING STEP ***',reslist,res_cut)
                 print(jnp.max(jnp.abs(sol2-np.diag(np.diag(sol2)))),jnp.max(jnp.abs(sol4)),jnp.max(jnp.abs(c3)))
                 dm_list = jnp.linspace(0,5.,5,endpoint=True)
                 if order == 4:
-                    soln2 = ode(int_ode_random_O4,[sol2,sol4,c1,c3],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=1e-8,atol=1e-8)
+                    soln2 = ode(int_ode_random_O4,[sol2,sol4,c1,c3],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=_rtol,atol=_atol)
                     sol2,sol4,c1,c3 = soln2[0][-1],soln2[1][-1],soln2[2][-1],soln2[3][-1]
                 elif order == 6:
-                    soln2 = ode(int_ode_random_O6,[sol2,sol4,c1,c3,sol6,c5],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=1e-8,atol=1e-8)
+                    soln2 = ode(int_ode_random_O6,[sol2,sol4,c1,c3,sol6,c5],np.array([dm_list[0],dm_list[-1]]),res_cut,rtol=_rtol,atol=_atol)
                     sol2,sol4,c1,c3,sol6,c5 = soln2[0][-1],soln2[1][-1],soln2[2][-1],soln2[3][-1],soln2[4][-1],soln2[5][-1]
                 reslist = res(n,sol2,res_cut,cutoff=cutoff)
                 scramble += 1
+                t_scramble_extra += time.perf_counter() - _t1
 
                 # Breaks if flow is slow, but no more resonances can be detected for an extended period
                 # Indicates potential degeneracies that cannot be removed 
@@ -2137,6 +2170,11 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     dl_list = dl_list[0:k]
     print('No. of scrambling steps: ', scramble)
     print('* TRUNCATION ERROR *',trunc_err,sol_norm,trunc_err/sol_norm)
+    if timelog:
+        print(
+            "TIMING(s): scramble_init=%.3f flow_ode=%.3f scramble_extra=%.3f total=%.3f"
+            % (t_scramble, t_flow, t_scramble_extra, (t_scramble + t_flow + t_scramble_extra))
+        )
     if order == 4:
         print('Max LIOM terms: ',jnp.max(jnp.abs(c1)),jnp.max(jnp.abs(c3)))
     elif order == 6:
@@ -2176,11 +2214,16 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     # whereas the creation/annihilation operators are c^{\dagger} c^{\dagger} c / c^{\dagger} c c
     l4 = -np.einsum('a,bcd->acbd',liom_fwd1,np.transpose(liom_fwd3)) - np.einsum('abc,d->acbd',liom_fwd3,np.transpose(liom_fwd1))
     l4 += -np.einsum('abc,cde->adbe',liom_fwd3,np.transpose(liom_fwd3))
-    if n <= 36:
-        l6 = np.einsum('abc,def->afbcde',liom_fwd3,np.transpose(liom_fwd3))
+    # NOTE: l6 is an n^6 tensor. Even at n=25, float64 l6 is ~1.9 GiB and can OOM-kill the process.
+    # Default: do NOT compute l6 unless explicitly requested.
+    compute_l6 = os.environ.get("PYFLOW_COMPUTE_L6", "0") in ("1", "true", "True")
+    if compute_l6 and n <= 12:
+        l6 = np.einsum("abc,def->afbcde", liom_fwd3, np.transpose(liom_fwd3))
         if order == 6:
-            liom_fwd5 = np.array(liom_fwd5,dtype=np.float64)
-            l6 += -np.einsum('abcde,f->adbecf',liom_fwd5,jnp.transpose(liom_fwd1)) + -1*np.einsum('a,bcdef->adbecf',liom_fwd1,np.transpose(liom_fwd5))
+            liom_fwd5 = np.array(liom_fwd5, dtype=np.float64)
+            l6 += -np.einsum("abcde,f->adbecf", liom_fwd5, jnp.transpose(liom_fwd1)) + -1 * np.einsum(
+                "a,bcdef->adbecf", liom_fwd1, np.transpose(liom_fwd5)
+            )
     else:
         l6 = jnp.array([0.])
 
@@ -2209,7 +2252,7 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     for i in range(n):
         l4[i,:,i,:] = 0
         l4[:,i,:,i] = 0
-        if n <= 36:
+        if compute_l6 and n <= 12:
             l6[i,:,i,:,:,:] = 0
             l6[i,:,:,:,i,:] = 0
             l6[:,:,i,:,i,:] = 0

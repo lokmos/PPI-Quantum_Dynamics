@@ -123,6 +123,9 @@ store_flow = False              # Store the full flow of the Hamiltonian and LIO
 dis_type = str(sys.argv[2])     # Options: 'random', 'QPgolden', 'QPsilver', 'QPbronze', 'QPrandom', 'linear', 'curved', 'prime'
                                 # Also contains 'test' and 'QPtest', potentials that do not change from run to run
 xlist = [1.]
+
+# Checkpoint mode: only affects branches that call flow_static_int (LIOM='bck' path).
+checkpoint_mode = os.environ.get("USE_CKPT", "0") in ("1", "true", "True")
 # For 'dis_type = curved', controls the gradient of the curvature
 if intr == False:               # Zero the interactions if set to False (for ED comparison and filename)
     delta = 0
@@ -174,7 +177,7 @@ if __name__ == '__main__':
                     # Create dictionary of parameters to pass to functions; avoids having to have too many function args
                     params = {"n":n,"delta":delta,"J":J,"cutoff":cutoff,"dis":dis,"dsymm":dsymm,"NO_state":no_state,"lmax":lmax,"qmax":qmax,"norm":norm,"Hflow":Hflow,"method":method, "intr":intr,"dyn":dyn,"imbalance":imbalance,"species":species,
                                     "LIOM":LIOM, "dyn_MF":dyn_MF,"logflow":logflow,"dis_type":dis_type,"x":x,"tlist":tlist,"store_flow":store_flow,"ITC":ITC,
-                                    "ladder":ladder,"order":order,"dim":dim}
+                                    "ladder":ladder,"order":order,"dim":dim,"checkpoint_mode":checkpoint_mode}
 
                     #-----------------------------------------------------------------
                     # Initialise Hamiltonian
@@ -314,14 +317,20 @@ if __name__ == '__main__':
                                 hf.create_dataset('flow4',data=flow["flow4"])
                                 hf.create_dataset('dl_list',data=flow["dl_list"])
                         if intr == True:
-                                hf.create_dataset('LIOM Interactions', data = flow["lbits"])
+                                liom_int = flow.get("lbits", flow.get("LIOM Interactions", None))
+                                if liom_int is not None:
+                                    hf.create_dataset('LIOM Interactions', data=liom_int)
                                 if ITC == False and ladder == False:
                                     hf.create_dataset('liom2', data = flow["LIOM2"], compression='gzip', compression_opts=9)
                                     hf.create_dataset('liom4', data = flow["LIOM4"], compression='gzip', compression_opts=9)
                                 hf.create_dataset('Hint', data = flow["Hint"], compression='gzip', compression_opts=9)
                                 if ladder == False:
-                                    hf.create_dataset('liom2_fwd', data = flow["LIOM2_FWD"], compression='gzip', compression_opts=9)
-                                    hf.create_dataset('liom4_fwd', data = flow["LIOM4_FWD"], compression='gzip', compression_opts=9)
+                                    liom2_fwd = flow.get("LIOM2_FWD", flow.get("LIOM2", None))
+                                    liom4_fwd = flow.get("LIOM4_FWD", flow.get("LIOM4", None))
+                                    if liom2_fwd is not None:
+                                        hf.create_dataset('liom2_fwd', data=liom2_fwd, compression='gzip', compression_opts=9)
+                                    if liom4_fwd is not None:
+                                        hf.create_dataset('liom4_fwd', data=liom4_fwd, compression='gzip', compression_opts=9)
                                 elif ladder == True:
                                     hf.create_dataset('liom1_fwd', data = flow["LIOM1_FWD"], compression='gzip', compression_opts=9)
                                     hf.create_dataset('liom3_fwd', data = flow["LIOM3_FWD"], compression='gzip', compression_opts=9)

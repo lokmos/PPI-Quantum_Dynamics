@@ -53,6 +53,7 @@ import h5py,gc
 import core.diag as diag
 import models.models as models
 import core.utility as utility
+from core.memlog import memlog, close as memlog_close
 # ED (QuSpin) is optional. For flow-only runs we skip ED entirely.
 try:
     from ED.ed import ED  # type: ignore
@@ -160,6 +161,7 @@ if __name__ == '__main__':
 
     startTime = datetime.now()
     print('Start time: ', startTime)
+    memlog("main:start")
 
     for p in [int(sys.argv[5])]:
         for x in xlist:
@@ -183,12 +185,14 @@ if __name__ == '__main__':
                         ham.build(n,dim,d,J,x,delta_onsite=delta,delta_up=0.,delta_down=0.,dsymm=dsymm)
 
                     print(ham.H2_spinless)
+                    memlog("main:after_ham_build", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n))
                     # Initialise the number operator on the central lattice site
                     num = jnp.zeros((n,n))
                     num = num.at[n//2,n//2].set(1.0)
                     
                     # Initialise higher-order parts of number operator (empty)
                     num_int=jnp.zeros((n,n,n,n),dtype=jnp.float64)
+                    memlog("main:after_init_ops", step=p)
                     
                     #-----------------------------------------------------------------
 
@@ -201,9 +205,20 @@ if __name__ == '__main__':
                     #-----------------------------------------------------------------
 
                     # Diagonalise with flow equations
+                    # If enabled, place the per-step memlog file in the run output directory.
+                    if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True") and not os.environ.get("PYFLOW_MEMLOG_FILE"):
+                        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                        test_dir = os.path.join(repo_root, "test")
+                        os.makedirs(test_dir, exist_ok=True)
+                        os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(
+                            test_dir,
+                            f"memlog-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}.jsonl",
+                        )
+                    memlog("main:before_flow", step=p)
                     flow_startTime = datetime.now()
                     flow = diag.CUT(params,ham,num,num_int)
                     flow_endTime = datetime.now()-flow_startTime
+                    memlog("main:after_flow", step=p)
 
                     # bessel = jnp.zeros(L)
                     # for i in range(L):
@@ -274,6 +289,7 @@ if __name__ == '__main__':
 
                     #==============================================================
                     # Export data   
+                    memlog("main:before_h5_write", step=p)
                     with h5py.File('%s/tflow-d%.2f-O%s-x%.2f-Jz%.2f-p%s.h5' %(nvar,d,order,x,delta,p),'w') as hf:
                         hf.create_dataset('params',data=str(params))
                         hf.create_dataset('fe_runtime',data=str(flow_endTime))
@@ -325,11 +341,14 @@ if __name__ == '__main__':
                                 hf.create_dataset('flow_dyn', data = flow["Density Dynamics"])
                             if n <= ncut:
                                 hf.create_dataset('ed_dyn', data = ed_dyn)
+                    memlog("main:after_h5_write", step=p)
                                     
                 gc.collect()
+                memlog("main:after_gc", step=p)
                 print('****************')
                 print('Time taken for one run:',datetime.now()-startTime)
                 print('****************')
+                memlog_close()
 
     #plt.xscale('log')
     #plt.legend()

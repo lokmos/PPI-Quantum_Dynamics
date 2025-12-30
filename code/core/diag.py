@@ -62,6 +62,14 @@ def CUT(params,hamiltonian,num,num_int):
     order = params["order"]
     dim = params["dim"]
 
+    # Unified checkpoint switch:
+    # - Preferred key: params["checkpoint_mode"] (bool)
+    # - Backwards-compatible key: params["checkpoint"] (bool)
+    # - Env override: USE_CKPT=1 forces checkpoint_mode on
+    use_ckpt = bool(params.get("checkpoint_mode", params.get("checkpoint", False)))
+    if os.environ.get("USE_CKPT", "0") in ("1", "true", "True"):
+        use_ckpt = True
+
     if logflow == False:
             dl = np.linspace(0,lmax,qmax,endpoint=True)
     elif logflow == True:
@@ -83,7 +91,20 @@ def CUT(params,hamiltonian,num,num_int):
         elif dyn == False:
             if intr == True:
                 if LIOM == 'bck':
-                    flow = flow_static_int(n,hamiltonian,dl,qmax,cutoff,method=method,norm=norm,Hflow=Hflow,store_flow=store_flow)
+                    if use_ckpt:
+                        # 如果开启，调用上面的优化版函数
+                        print("--- [MODE SWITCH] Using Checkpoint Optimization (Low Memory) ---")
+                        flow = flow_static_int_ckpt(
+                            n, hamiltonian, dl, qmax, cutoff,
+                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                        )
+                    else:
+                        # 如果关闭，调用原版函数
+                        print("--- [MODE SWITCH] Using Standard Mode (High Memory) ---")
+                        flow = flow_static_int(
+                            n, hamiltonian, dl, qmax, cutoff,
+                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                        )
                 elif LIOM == 'fwd':
                     flow = flow_static_int_fwd(n,hamiltonian,dl,qmax,cutoff,method=method,norm=norm,Hflow=Hflow,store_flow=store_flow)
             elif intr == False:

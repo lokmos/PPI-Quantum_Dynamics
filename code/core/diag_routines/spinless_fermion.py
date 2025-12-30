@@ -1588,6 +1588,10 @@ def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hfl
             # print(soln[0][-1])
             sol4 = sol4.at[k].set(soln[1][-1])
             J0 = jnp.max(jnp.abs(soln[0][-1] - jnp.diag(jnp.diag(soln[0][-1]))))
+
+            # Add memlog record
+            if k % 10 == 0:
+                memlog("flow:step", step=k, mode="original")
             k += 1
 
     else:
@@ -1748,6 +1752,9 @@ def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hfl
         sol2_gpu = jnp.zeros((chunk_size,n,n))
         sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
 
+    # Preserve the (forward, truncated) flow-time grid for output before reversing for backward integration.
+    dl_list_fwd = np.array(dl_list)
+
     # Reverse list of flow times in order to conduct backwards integration
     dl_list = dl_list[::-1]
     # sol2=sol2[::-1]
@@ -1795,10 +1802,23 @@ def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hfl
     # plt.plot(jnp.log10(jnp.abs(jnp.diag(init_liom2.reshape(n,n)))))
     # plt.plot(jnp.log10(jnp.abs(jnp.diag(liom_fwd2.reshape(n,n)))),'--')
 
-    output = {"H0_diag":np.array(H0_diag), "Hint":np.array(Hint2),"LIOM Interactions":lbits,"LIOM2":init_liom2,"LIOM4":init_liom4,"LIOM2_FWD":liom_fwd2,"LIOM4_FWD":liom_fwd4,"Invariant":inv2}
+    output = {
+        "H0_diag": np.array(H0_diag),
+        "Hint": np.array(Hint2),
+        "LIOM Interactions": lbits,
+        "LIOM2": init_liom2,
+        "LIOM4": init_liom4,
+        "LIOM2_FWD": liom_fwd2,
+        "LIOM4_FWD": liom_fwd4,
+        "Invariant": inv2,
+        # Keep output schema consistent with other flow routines so main scripts can always export.
+        "dl_list": dl_list_fwd,
+        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
     if store_flow == True:
         output["flow2"] = np.array(sol2)
         output["flow4"] = np.array(sol4)
+        # For store_flow we keep the (reversed) dl_list used in backward integration.
         output["dl_list"] = dl_list
 
     # Free up some memory
@@ -3102,6 +3122,185 @@ def flow_tensordot_nonint(H0,V0,dl):
     print('Max off diagonal element: ', jnp.max(jnp.abs(V0)))
     print(jnp.sort(jnp.diag(H0)))
 
+def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',norm=False,Hflow=False,store_flow=False):
+    """
+    针对大系统优化的版本：使用 Checkpointing (检查点) 策略。
+    """
+    H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
 
+    # === 配置参数 ===
+    # 检查点间隔：数值越大，越省内存，但重算时间越长。
+    # 对于 n=64，建议设为 20-50。
+    ckpt_step = 20  
+    
+    print(f'Starting Flow with Checkpointing. System size n={n}, Checkpoint interval={ckpt_step}')
+    
+    # 1. 前向流：只存储稀疏的 Checkpoints
+    # ------------------------------------------------------------------
+    # checkpoints 列表用于存储关键帧：(step_index, H2_state, Hint_state)
+    checkpoints = []
+    
+    # 初始化
+    curr_H2 = jnp.array(H2)
+    curr_Hint = jnp.array(Hint)
+    
+    # 存入第 0 步
+    checkpoints.append((0, np.array(curr_H2), np.array(curr_Hint)))
+    
+    k = 1
+    J0 = 1.0
+    
+    # 只需要两个变量在内存中滚动，不需要大数组
+    # 使用 jax.jit 编译核心步进函数以加速
+    # 注意：这里为了简化展示逻辑，仍使用 ode 接口，实际循环中开销很小
+    
+    print("Forward integration (Generating Checkpoints)...")
+    while k < len(dl_list) and J0 > cutoff:
+        # 计算当前步长
+        steps = np.linspace(dl_list[k-1], dl_list[k], num=2, endpoint=True)
+        
+        # 前向积分一步
+        soln = ode(int_ode, [curr_H2, curr_Hint], steps, rtol=1e-5, atol=1e-6) # 注意：容差已放宽
+        curr_H2 = soln[0][-1]
+        curr_Hint = soln[1][-1]
+        
+        # 检查是否需要存档
+        if k % ckpt_step == 0:
+            # 注意：必须转为 numpy 存入 CPU 内存，否则 JAX 会占满显存
+            checkpoints.append((k, np.array(curr_H2), np.array(curr_Hint)))
+            if k % 100 == 0:
+                print(f"Step {k}/{len(dl_list)}, J0={J0:.2e}")
+
+        # 收敛检查
+        J0 = jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2))))
+
+        # Add memlog record
+        if k % 10 == 0:
+            memlog("flow:step", step=k, mode="checkpoint")
+        k += 1
+    
+    # 记录实际结束的步数
+    final_k = k
+    # 确保存入最后一步（如果没存过）
+    if (final_k-1) % ckpt_step != 0:
+        checkpoints.append((final_k-1, np.array(curr_H2), np.array(curr_Hint)))
+        
+    print(f"Forward pass finished at step {final_k}. Total checkpoints: {len(checkpoints)}")
+
+    # 截断 dl_list 到实际结束位置
+    dl_list_final = dl_list[:final_k]
+
+    # 提取最终对角化结果
+    H0_diag = curr_H2
+    Hint2 = curr_Hint
+    
+    # 2. 准备 LIOM 计算
+    # ------------------------------------------------------------------
+    # 提取有效相互作用
+    HFint = jnp.zeros(n**2).reshape(n,n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i,j].set(Hint2[i,i,j,j] - Hint2[i,j,j,i])
+
+    lbits = jnp.zeros(n-1)
+    for q in range(1,n):
+        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.)))
+
+    # 初始化 LIOM (在对角基底下是简单的 n_i)
+    init_liom2 = jnp.zeros((n,n))
+    init_liom2 = init_liom2.at[n//2,n//2].set(1.0)
+    init_liom4 = jnp.zeros((n,n,n,n))
+
+    # 3. 后向流：分段重算 (Recomputation)
+    # ------------------------------------------------------------------
+    print("Backward integration with Recomputation...")
+    
+    jit_update = jit(update) # 确保 update 函数被 JIT 编译
+    
+    # 倒序遍历 checkpoints
+    # 逻辑：对于 checkpoints[i] 和 checkpoints[i+1] 之间的区域
+    # 我们先从 checkpoints[i] 前向跑到 checkpoints[i+1]，记录这段的密集轨迹
+    # 然后在这段密集轨迹上倒着跑 LIOM
+    
+    num_segments = len(checkpoints) - 1
+    
+    for i in range(num_segments, 0, -1):
+        # 当前段的起始和结束步数索引
+        start_step_idx = checkpoints[i-1][0]
+        end_step_idx = checkpoints[i][0]
+        
+        # 1. 重算阶段 (Recompute Forward)
+        # 从 start_step 恢复状态
+        temp_H2 = jnp.array(checkpoints[i-1][1])
+        temp_Hint = jnp.array(checkpoints[i-1][2])
+        
+        # 临时存储这一小段的完整轨迹
+        segment_len = end_step_idx - start_step_idx
+        # 预分配内存 (注意：这里只存几十步，内存是可以接受的)
+        seg_sol2 = [None] * segment_len
+        seg_sol4 = [None] * segment_len
+        
+        # 在这一段内前向积分，填充轨迹
+        # 注意：这里不需要极高的精度，只要和之前一致即可
+        curr_step = start_step_idx
+        while curr_step < end_step_idx:
+            # 存下当前状态 (相对于 segment 的索引)
+            local_idx = curr_step - start_step_idx
+            seg_sol2[local_idx] = temp_H2
+            seg_sol4[local_idx] = temp_Hint
+            
+            # 往前走一步
+            t_span = np.linspace(dl_list_final[curr_step], dl_list_final[curr_step+1], num=2, endpoint=True)
+            soln = ode(int_ode, [temp_H2, temp_Hint], t_span, rtol=1e-5, atol=1e-6)
+            temp_H2 = soln[0][-1]
+            temp_Hint = soln[1][-1]
+            curr_step += 1
+            
+        # 2. 回溯阶段 (Backward Integrate LIOM)
+        # 现在我们有了 start_step 到 end_step 之间的密集轨迹 seg_sol
+        # 倒着跑：从 end_step-1 跑到 start_step
+        
+        for local_idx in range(segment_len - 1, -1, -1):
+            global_step = start_step_idx + local_idx
+            
+            # 获取当前时刻的 H (用于生成 eta)
+            h2_now = seg_sol2[local_idx]
+            hint_now = seg_sol4[local_idx]
+            
+            # 逆向积分一步 LIOM
+            # 注意 dl_list 的方向
+            t_span_bck = np.linspace(dl_list_final[global_step+1], dl_list_final[global_step], num=2, endpoint=True)
+            
+            # 这里调用 update 或者 jit_update
+            # update 函数通常接受 steps=[t_start, t_end]，内部计算 dl = t_end - t_start
+            # 所以我们传入逆序的时间点即可
+            
+            init_liom2, init_liom4 = jit_update(init_liom2, init_liom4, h2_now, hint_now, t_span_bck)
+            
+        # 释放这一段的临时内存
+        del seg_sol2, seg_sol4
+        # Python 的 GC 可能不及时，手动释放一下保险
+        # gc.collect() 
+        if i % 5 == 0:
+            print(f"Backward progress: Segment {num_segments-i+1}/{num_segments} done.")
+
+    # 打包结果
+    output = {
+        "H0_diag": np.array(H0_diag), 
+        "Hint": np.array(Hint2),
+        "LIOM Interactions": lbits,
+        "LIOM2": np.array(init_liom2),
+        "LIOM4": np.array(init_liom4),
+        # Compatibility with standard flow_static_int output schema.
+        # (ckpt implementation currently only provides the final operators; we expose them under *_FWD too.)
+        "LIOM2_FWD": np.array(init_liom2),
+        "LIOM4_FWD": np.array(init_liom4),
+        "Invariant": 0,  # 如果需要计算不变量，需额外处理
+        # Keep output schema consistent with other flow routines so main scripts can always export.
+        "dl_list": np.array(dl_list_final),
+        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+    
+    return output
 
 

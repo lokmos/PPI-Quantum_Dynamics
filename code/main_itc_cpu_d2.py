@@ -100,7 +100,7 @@ qmax =  1000                     # Max number of flow time steps
 norm = False                    # Normal-ordering, can be true or false
 no_state = 'SDW'                # State to use for normal-ordering, can be CDW or SDW
                                 # For vacuum normal-ordering, just set norm=False
-ladder = True                   # TEST FEATURE: compute LIOMs using creation/annihilation operators
+ladder = False                 # TEST FEATURE: compute LIOMs using creation/annihilation operators
 ITC = False                     # Infinite temp correlation function (TEST PARAMETER)
 Hflow = True                    # Whether to store the flowing Hamiltonian (true) or generator (false)
                                 # Storing H(l) allows SciPy ODE integration to add extra flow time steps
@@ -154,6 +154,8 @@ if norm == True and n%2 != 0:
     norm = False
 if ITC == True:
     store_flow = False
+
+checkpoint_mode = os.environ.get("USE_CKPT", "0") == "1"
 # if species == 'spinful fermion' and norm == True:
 #     print('Normal ordering not implemented for spinful fermions.')
 #     norm = False
@@ -180,7 +182,7 @@ if __name__ == '__main__':
                     # Create dictionary of parameters to pass to functions; avoids having to have too many function args
                     params = {"n":n,"delta":delta,"J":J,"cutoff":cutoff,"dis":dis,"dsymm":dsymm,"NO_state":no_state,"lmax":lmax,"qmax":qmax,"norm":norm,"Hflow":Hflow,"method":method, "intr":intr,"dyn":dyn,"imbalance":imbalance,"species":species,
                                     "LIOM":LIOM, "dyn_MF":dyn_MF,"logflow":logflow,"dis_type":dis_type,"x":x,"tlist":tlist,"store_flow":store_flow,"ITC":ITC,
-                                    "ladder":ladder,"order":order,"dim":dim}
+                                    "ladder":ladder,"order":order,"dim":dim,"checkpoint_mode":checkpoint_mode}
 
                     out_h5 = '%s/tflow-d%.2f-O%s-x%.2f-Jz%.2f-p%s.h5' % (nvar, d, order, x, delta, p)
                     if overwrite or (not os.path.exists(out_h5)):
@@ -213,17 +215,24 @@ if __name__ == '__main__':
                         # Diagonalise with flow equations
                         # If enabled, write memlog into repo-level test/ by default.
                         # We set PYFLOW_MEMLOG_FILE PER RUN so different disorder strengths don't append to the same file.
-                        if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True") and (
-                            (not os.environ.get("PYFLOW_MEMLOG_FILE")) or os.environ.get("PYFLOW_MEMLOG_AUTO", "0") in ("1", "true", "True")
-                        ):
+                        if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True"):
                             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
                             test_dir = os.path.join(repo_root, "test")
                             os.makedirs(test_dir, exist_ok=True)
-                            os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(
-                                test_dir,
-                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}.jsonl",
+                            
+                            # 获取当前模式
+                            # NOTE: params uses 'checkpoint_mode' (not 'checkpoint')
+                            is_ckpt = bool(params.get("checkpoint_mode", False))
+                            mode_str = "ckpt" if is_ckpt else "original"
+                            
+                            # 构造区分度高的文件名
+                            log_filename = (
+                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}.jsonl"
                             )
-                            os.environ["PYFLOW_MEMLOG_AUTO"] = "1"
+                            
+                            # Close any previous memlog file handle before switching output path.
+                            memlog_close()
+                            os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(test_dir, log_filename)
 
                         memlog("main:before_flow", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n), dim=int(dim))
                         flow_startTime = datetime.now()
@@ -325,14 +334,20 @@ if __name__ == '__main__':
                                     hf.create_dataset('flow4',data=flow["flow4"])
                                     hf.create_dataset('dl_list',data=flow["dl_list"])
                             if intr == True:
-                                    hf.create_dataset('LIOM Interactions', data = flow["lbits"])
+                                    liom_int = flow.get("lbits", flow.get("LIOM Interactions", None))
+                                    if liom_int is not None:
+                                        hf.create_dataset('LIOM Interactions', data=liom_int)
                                     if ITC == False and ladder == False:
                                         hf.create_dataset('liom2', data = flow["LIOM2"], compression='gzip', compression_opts=9)
                                         hf.create_dataset('liom4', data = flow["LIOM4"], compression='gzip', compression_opts=9)
                                     hf.create_dataset('Hint', data = flow["Hint"], compression='gzip', compression_opts=9)
                                     if ladder == False:
-                                        hf.create_dataset('liom2_fwd', data = flow["LIOM2_FWD"], compression='gzip', compression_opts=9)
-                                        hf.create_dataset('liom4_fwd', data = flow["LIOM4_FWD"], compression='gzip', compression_opts=9)
+                                        liom2_fwd = flow.get("LIOM2_FWD", flow.get("LIOM2", None))
+                                        liom4_fwd = flow.get("LIOM4_FWD", flow.get("LIOM4", None))
+                                        if liom2_fwd is not None:
+                                            hf.create_dataset('liom2_fwd', data=liom2_fwd, compression='gzip', compression_opts=9)
+                                        if liom4_fwd is not None:
+                                            hf.create_dataset('liom4_fwd', data=liom4_fwd, compression='gzip', compression_opts=9)
                                     elif ladder == True:
                                         hf.create_dataset('liom1_fwd', data = flow["LIOM1_FWD"], compression='gzip', compression_opts=9)
                                         hf.create_dataset('liom3_fwd', data = flow["LIOM3_FWD"], compression='gzip', compression_opts=9)

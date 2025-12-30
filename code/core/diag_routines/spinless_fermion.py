@@ -75,6 +75,23 @@ from  jax.experimental.ode import odeint as ode
 from scipy.integrate import ode as ode_np
 #import matplotlib.pyplot as plt
 from jax.numpy.linalg import norm as frn
+from ..memlog import memlog
+
+# Optional memory logging (disabled by default).
+def _mem_every() -> int:
+    try:
+        return int(os.environ.get("PYFLOW_MEMLOG_EVERY", "0"))
+    except Exception:
+        return 0
+
+
+def _memlog(tag: str, step: int | None = None, l: float | None = None, **fields):
+    every = _mem_every()
+    if every <= 0:
+        return
+    if step is not None and (step % every != 0):
+        return
+    memlog(tag, step=step, l=l, **fields)
 
 
 #------------------------------------------------------------------------------ 
@@ -1469,7 +1486,7 @@ def flow_static(n,hamiltonian,dl_list,qmax,cutoff,method='jit',store_flow=True):
 # @jit(nopython=True,parallel=True,fastmath=True)
 def proc(mat,cutoff):
     """ Test function to zero all matrix elements below a cutoff. """
-    for i in prange(len(mat)):
+    for i in range(len(mat)):
         if mat[i] < cutoff:
             mat[i] = 0.
     return mat
@@ -1864,9 +1881,15 @@ def flow_int_ITC(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,
 
     print(liom_fwd2)
 
-    plt.plot(tlist,corr,'rx--')
-    # plt.show()
-    # plt.close()
+    # Optional debug plot (safe if matplotlib is installed).
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        plt.plot(tlist, corr, "rx--")
+        # plt.show()
+        # plt.close()
+    except Exception:
+        pass
 
     output = {"H0_diag":np.array(H0_diag), "Hint":np.array(Hint2),"LIOM2_FWD":liom_fwd2,"LIOM4_FWD":liom_fwd4,"dyn": dyn, "corr":corr}
 
@@ -2011,7 +2034,14 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     n1 = 0.
     n2 = 0.
     sctime = 0
+    _memlog("flow_int_fl:init", step=0, l=0.0, n=int(n), qmax=int(qmax), order=int(order), dim=int(dim))
     while k < len(dl_list)-1 and (J0 > cutoff or J2 > 1e-3):
+        # Periodic memory sampling (RSS) to build a memory-vs-step trace.
+        try:
+            l_now = float(np.array(dl_list[k]))
+        except Exception:
+            l_now = None
+        _memlog("flow_int_fl:loop", step=int(k), l=l_now, J0=float(J0), J2=float(J2))
 
         # Break loop if a situation is encountered where the quadratic part has decayed, but the 
         # quartic off-diagonal terms are unchanging. This likely reflects some sort of 2-particle
@@ -2225,6 +2255,8 @@ def flow_int_fl(n,hamiltonian,dl_list,qmax,cutoff,tlist,method='jit',norm=True,H
     lbits = []
     for q in range(1,n):
         lbits += [np.mean(np.abs(np.diag(HF,q)))]
+
+    _memlog("flow_int_fl:postprocess_done", step=int(k), l=float(np.array(dl_list[min(k, len(dl_list)-1)])))
 
     # itc requires the (optional) dynamics module (QuSpin). For flow-only runs, return zeros.
     if dyn_itc is None:

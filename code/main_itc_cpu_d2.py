@@ -53,6 +53,7 @@ import h5py,gc
 import core.diag as diag
 import models.models as models
 import core.utility as utility
+from core.memlog import memlog, close as memlog_close
 # ED (QuSpin) is optional. For flow-only runs we skip ED entirely.
 try:
     from ED.ed import ED  # type: ignore
@@ -160,6 +161,9 @@ if __name__ == '__main__':
 
     startTime = datetime.now()
     print('Start time: ', startTime)
+    memlog("main:start")
+
+    overwrite = os.environ.get("PYFLOW_OVERWRITE", "0") in ("1", "true", "True")
 
     for p in [int(sys.argv[5])]:
         for x in xlist:
@@ -174,7 +178,8 @@ if __name__ == '__main__':
                                     "LIOM":LIOM, "dyn_MF":dyn_MF,"logflow":logflow,"dis_type":dis_type,"x":x,"tlist":tlist,"store_flow":store_flow,"ITC":ITC,
                                     "ladder":ladder,"order":order,"dim":dim}
 
-                    if not os.path.exists('%s/tflow-d%.2f-O%s-x%.2f-Jz%.2f-p%s.h5' %(nvar,d,order,x,delta,p)):
+                    out_h5 = '%s/tflow-d%.2f-O%s-x%.2f-Jz%.2f-p%s.h5' % (nvar, d, order, x, delta, p)
+                    if overwrite or (not os.path.exists(out_h5)):
                         #-----------------------------------------------------------------
                         # Initialise Hamiltonian
                         ham = models.hamiltonian(species,dis_type,intr=intr)
@@ -202,9 +207,25 @@ if __name__ == '__main__':
                         #-----------------------------------------------------------------
 
                         # Diagonalise with flow equations
+                        # If enabled, write memlog into repo-level test/ by default.
+                        # We set PYFLOW_MEMLOG_FILE PER RUN so different disorder strengths don't append to the same file.
+                        if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True") and (
+                            (not os.environ.get("PYFLOW_MEMLOG_FILE")) or os.environ.get("PYFLOW_MEMLOG_AUTO", "0") in ("1", "true", "True")
+                        ):
+                            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                            test_dir = os.path.join(repo_root, "test")
+                            os.makedirs(test_dir, exist_ok=True)
+                            os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(
+                                test_dir,
+                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}.jsonl",
+                            )
+                            os.environ["PYFLOW_MEMLOG_AUTO"] = "1"
+
+                        memlog("main:before_flow", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n), dim=int(dim))
                         flow_startTime = datetime.now()
                         flow = diag.CUT(params,ham,num,num_int)
                         flow_endTime = datetime.now()-flow_startTime
+                        memlog("main:after_flow", step=p)
 
                         # bessel = jnp.zeros(L)
                         # for i in range(L):
@@ -274,8 +295,9 @@ if __name__ == '__main__':
                         #    plt.close()
 
                         #==============================================================
-                        # Export data   
-                        with h5py.File('%s/tflow-d%.2f-O%s-x%.2f-Jz%.2f-p%s.h5' %(nvar,d,order,x,delta,p),'w') as hf:
+                        # Export data
+                        memlog("main:before_h5_write", step=p)
+                        with h5py.File(out_h5, 'w') as hf:
                             hf.create_dataset('params',data=str(params))
                             hf.create_dataset('fe_runtime',data=str(flow_endTime))
                             hf.create_dataset('trunc_err',data=flow["truncation_err"])
@@ -326,11 +348,14 @@ if __name__ == '__main__':
                                     hf.create_dataset('flow_dyn', data = flow["Density Dynamics"])
                                 if n <= ncut:
                                     hf.create_dataset('ed_dyn', data = ed_dyn)
+                        memlog("main:after_h5_write", step=p)
                                         
-                    gc.collect()
-                    print('****************')
-                    print('Time taken for one run:',datetime.now()-startTime)
-                    print('****************')
+                gc.collect()
+                memlog("main:after_gc", step=p)
+                memlog_close()
+                print('****************')
+                print('Time taken for one run:',datetime.now()-startTime)
+                print('****************')
 
         #plt.xscale('log')
         #plt.legend()

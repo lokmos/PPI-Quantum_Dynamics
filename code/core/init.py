@@ -129,8 +129,9 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
     # Initialise V0 with nearest-neighbour hopping
     if pwrhop == False and dim ==1:
         V0 = np.diag(J*np.ones(n-1,dtype=np.float32),1) + np.diag(J*np.ones(n-1,dtype=np.float32),-1)
-    elif pwrhop == False and dim ==2:
-        L = np.int(np.sqrt(n))
+    elif pwrhop == False and dim == 2:
+        # np.int was removed in NumPy>=2.0; use builtin int.
+        L = int(np.sqrt(n))
         jmat = np.diagflat(np.concatenate([[J for i in range(L-1)]+[0] for j in range(L)])[0:-1], 1)+np.diagflat([J for i in range(n-L)], L)
         V0 = jmat + jmat.T
 

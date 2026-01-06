@@ -325,13 +325,13 @@ def flow_levels_old(n,array,intr,order=4):
 
 def flow_levels(n,array,intr,order=4):
     """ Function to compute the many-body eigenvalues from the Hamiltonian returned by the TFE method. """
-    H0 = array["H0_diag"]
+    H0 = np.asarray(array["H0_diag"], dtype=np.float64)
     if intr == True:
-        Hint = array["Hint"]
+        Hint = np.asarray(array["Hint"], dtype=np.float64)
     if order == 6:
-        H6 = array["H6"]
+        H6 = np.asarray(array["H6"], dtype=np.float64)
     else:
-        H6 = np.zeros(1).reshape(1,1,1,1,1,1)
+        H6 = np.zeros(1, dtype=np.float64).reshape(1,1,1,1,1,1)
 
     flevels = np.zeros(2**n)
     for i in range(2**n):

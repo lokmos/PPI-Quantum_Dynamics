@@ -33,7 +33,7 @@ from psutil import cpu_count
 os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False)))       # Set number of OpenMP threads to run in parallel
 os.environ['MKL_NUM_THREADS']= str(int(cpu_count(logical=False)))       # Set number of MKL threads to run in parallel
 os.environ['NUMBA_NUM_THREADS'] = str(int(cpu_count(logical=False)))    # Set number of Numba threads
-os.environ['JAX_ENABLE_X64'] = 'true'  
+os.environ['JAX_ENABLE_X64'] = 'false'  
 import jax.numpy as jnp
 from jax import jit
 from jax import make_jaxpr

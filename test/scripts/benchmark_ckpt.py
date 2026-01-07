@@ -3,11 +3,20 @@
 Benchmark script to compare memory usage between original and checkpoint modes.
 
 Usage:
-    python benchmark_ckpt.py [L_min] [L_max] [dis_type] [method] [d] [p]
+    python benchmark_ckpt.py [L_min] [L_max] [dis_type] [method] [d] [p] [options]
+
+Options:
+    --verbose, -v     Show real-time progress output
+    --tol=VALUE       Set ODE tolerance (rtol and atol), e.g. --tol=1e-4 for fast mode
+                      Default: 1e-6 (balanced), 1e-4 (fast), 1e-8 (precise)
+    --jit             Use JIT-optimized flow integration (experimental, faster)
 
 Examples:
-    python benchmark_ckpt.py 3 6           # L from 3 to 6 with defaults
+    python benchmark_ckpt.py 3 6                    # L from 3 to 6 with defaults
     python benchmark_ckpt.py 4 8 random tensordot 1.0 0
+    python benchmark_ckpt.py 3 4 --verbose          # Show real-time progress
+    python benchmark_ckpt.py 3 4 --tol=1e-4         # Fast mode (lower precision)
+    python benchmark_ckpt.py 3 4 --jit --tol=1e-4   # JIT mode with fast tolerance
 """
 
 import os
@@ -32,17 +41,28 @@ DEFAULT_DIS_TYPE = "random"
 DEFAULT_METHOD = "tensordot"
 DEFAULT_D = 1.0
 DEFAULT_P = 0
+DEFAULT_ODE_TOL = "1e-4"  # Default ODE tolerance (rtol and atol)
+
+# Get CPU count for parallelization
+from psutil import cpu_count
+_NUM_CORES = str(cpu_count(logical=False))
 
 # Environment variables for consistent runs
 BASE_ENV = {
     "PYFLOW_MEMLOG": "1",
-    "PYFLOW_MEMLOG_EVERY": "50",
+    "PYFLOW_MEMLOG_EVERY": "5",
     "PYFLOW_TIMELOG": "1",
     "PYFLOW_SCRAMBLE": "0",
-    "PYFLOW_ODE_RTOL": "1e-6",
-    "PYFLOW_ODE_ATOL": "1e-6",
     "PYFLOW_OVERWRITE": "1",
+    # Parallelization settings - use all physical cores
+    "OMP_NUM_THREADS": _NUM_CORES,
+    "MKL_NUM_THREADS": _NUM_CORES,
+    "OPENBLAS_NUM_THREADS": _NUM_CORES,
+    "NUMBA_NUM_THREADS": _NUM_CORES,
+    # XLA (JAX backend) parallelization
+    "XLA_FLAGS": f"--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads={_NUM_CORES}",
 }
+# Note: PYFLOW_ODE_RTOL and PYFLOW_ODE_ATOL are added dynamically based on --tol flag
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper functions
@@ -82,9 +102,20 @@ def parse_memlog(filepath: Path) -> dict:
     }
 
 
-def run_benchmark(L: int, dis_type: str, method: str, d: float, p: int, use_ckpt: bool) -> dict:
-    """Run a single benchmark and return results."""
-    mode = "ckpt" if use_ckpt else "original"
+def run_benchmark(L: int, dis_type: str, method: str, d: float, p: int, use_ckpt: bool, 
+                  verbose: bool = False, ode_tol: str = "1e-6", use_jit: bool = False) -> dict:
+    """Run a single benchmark and return results.
+    
+    Args:
+        verbose: If True, stream output in real-time instead of capturing.
+        ode_tol: ODE tolerance (both rtol and atol), e.g. "1e-6" or "1e-4"
+        use_jit: If True, enable JIT acceleration for the ODE function.
+    """
+    # Mode is determined by use_ckpt; JIT is an accelerator for both modes
+    if use_ckpt:
+        mode = "ckpt"
+    else:
+        mode = "original"
     dim = 2
     order = 4
     x = 0.0
@@ -102,6 +133,9 @@ def run_benchmark(L: int, dis_type: str, method: str, d: float, p: int, use_ckpt
     env = os.environ.copy()
     env.update(BASE_ENV)
     env["USE_CKPT"] = "1" if use_ckpt else "0"
+    env["USE_JIT_FLOW"] = "1" if use_jit else "0"
+    env["PYFLOW_ODE_RTOL"] = ode_tol
+    env["PYFLOW_ODE_ATOL"] = ode_tol
     
     # Build command - run from CODE_DIR where main_itc_cpu_d2.py lives
     cmd = [
@@ -118,22 +152,37 @@ def run_benchmark(L: int, dis_type: str, method: str, d: float, p: int, use_ckpt
     start_time = time.time()
     
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=CODE_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1 hour timeout
-        )
+        if verbose:
+            # Stream output in real-time
+            result = subprocess.run(
+                cmd,
+                cwd=CODE_DIR,
+                env=env,
+                timeout=360000,  # 1 hour timeout
+            )
+            stdout_text = ""
+            stderr_text = ""
+        else:
+            # Capture output quietly
+            result = subprocess.run(
+                cmd,
+                cwd=CODE_DIR,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=360000,  # 1 hour timeout
+            )
+            stdout_text = result.stdout
+            stderr_text = result.stderr
         elapsed = time.time() - start_time
         
         if result.returncode != 0:
             print(f"    ⚠ Process exited with code {result.returncode}")
             # Print last few lines of stderr for debugging
-            stderr_lines = result.stderr.strip().split("\n")[-5:]
-            for line in stderr_lines:
-                print(f"      {line}")
+            if stderr_text:
+                stderr_lines = stderr_text.strip().split("\n")[-5:]
+                for line in stderr_lines:
+                    print(f"      {line}")
             return {
                 "L": L,
                 "mode": mode,
@@ -248,6 +297,21 @@ def main():
     # Parse arguments
     args = sys.argv[1:]
     
+    # Check for --verbose / -v flag
+    verbose = "--verbose" in args or "-v" in args
+    args = [a for a in args if a not in ("--verbose", "-v")]
+    
+    # Check for --jit flag
+    use_jit = "--jit" in args
+    args = [a for a in args if a != "--jit"]
+    
+    # Check for --tol=VALUE flag
+    ode_tol = DEFAULT_ODE_TOL
+    for a in args:
+        if a.startswith("--tol="):
+            ode_tol = a.split("=", 1)[1]
+    args = [a for a in args if not a.startswith("--tol=")]
+    
     L_min = int(args[0]) if len(args) > 0 else 3
     L_max = int(args[1]) if len(args) > 1 else 6
     dis_type = args[2] if len(args) > 2 else DEFAULT_DIS_TYPE
@@ -263,6 +327,9 @@ def main():
     print(f"method:    {method}")
     print(f"d:         {d}")
     print(f"p:         {p}")
+    print(f"ODE tol:   {ode_tol}")
+    print(f"JIT mode:  {use_jit}")
+    print(f"Verbose:   {verbose}")
     print(f"Output:    {TEST_DIR}")
     print("=" * 80)
     
@@ -272,23 +339,30 @@ def main():
     results = []
     
     for L in range(L_min, L_max + 1):
-        print(f"\n[L={L}, n={L**2}]")
+        jit_label = " [JIT]" if use_jit else ""
+        print(f"\n[L={L}, n={L**2}]{jit_label}")
         
         # Run original mode first
-        result_orig = run_benchmark(L, dis_type, method, d, p, use_ckpt=False)
+        result_orig = run_benchmark(L, dis_type, method, d, p, use_ckpt=False, 
+                                    verbose=verbose, ode_tol=ode_tol, use_jit=use_jit)
         results.append(result_orig)
         
         if result_orig.get("status") == "ok":
-            print(f"    Original: {result_orig.get('rss_peak_mb', 'N/A'):.1f} MB peak, {result_orig.get('elapsed_s', 0):.1f}s")
+            rss = result_orig.get('rss_peak_mb', 'N/A')
+            rss_str = f"{float(rss):.1f}" if rss and rss != 'N/A' else "N/A"
+            print(f"    Original: {rss_str} MB peak, {result_orig.get('elapsed_s', 0):.1f}s")
         else:
             print(f"    Original: {result_orig.get('status', 'unknown')} - {result_orig.get('error', '')}")
         
         # Run checkpoint mode
-        result_ckpt = run_benchmark(L, dis_type, method, d, p, use_ckpt=True)
+        result_ckpt = run_benchmark(L, dis_type, method, d, p, use_ckpt=True, 
+                                    verbose=verbose, ode_tol=ode_tol, use_jit=use_jit)
         results.append(result_ckpt)
         
         if result_ckpt.get("status") == "ok":
-            print(f"    Ckpt:     {result_ckpt.get('rss_peak_mb', 'N/A'):.1f} MB peak, {result_ckpt.get('elapsed_s', 0):.1f}s")
+            rss = result_ckpt.get('rss_peak_mb', 'N/A')
+            rss_str = f"{float(rss):.1f}" if rss and rss != 'N/A' else "N/A"
+            print(f"    Ckpt:     {rss_str} MB peak, {result_ckpt.get('elapsed_s', 0):.1f}s")
         else:
             print(f"    Ckpt:     {result_ckpt.get('status', 'unknown')} - {result_ckpt.get('error', '')}")
     

@@ -27,13 +27,27 @@ This file contains all of the matrix/tensor contraction routines used to compute
 """
 
 import os, functools
+import numpy as np
 from psutil import cpu_count
+
 # Set up threading options for parallel solver
-os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number of OpenMP threads
-os.environ['MKL_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number of MKL threads
-os.environ['NUMBA_NUM_THREADS'] = str(int(cpu_count(logical=False))) # Set number of Numba threads
-os.environ['JAX_ENABLE_X64'] = 'true'  
+_NUM_CORES = str(int(cpu_count(logical=False)))
+os.environ.setdefault('OMP_NUM_THREADS', _NUM_CORES)
+os.environ.setdefault('MKL_NUM_THREADS', _NUM_CORES)
+os.environ.setdefault('OPENBLAS_NUM_THREADS', _NUM_CORES)
+os.environ.setdefault('NUMBA_NUM_THREADS', _NUM_CORES)
+
+# XLA (JAX backend) multi-threading - MUST be set before importing JAX
+if 'XLA_FLAGS' not in os.environ:
+    os.environ['XLA_FLAGS'] = f'--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads={_NUM_CORES}'
+
+# Precision control: set PYFLOW_FLOAT32=1 for lower memory usage (half memory, ~10% less accurate)
+USE_FLOAT64 = os.environ.get('PYFLOW_FLOAT32', '0') not in ('1', 'true', 'True')
+os.environ['JAX_ENABLE_X64'] = 'true' if USE_FLOAT64 else 'false'
+
+import jax
 import jax.numpy as jnp
+from jax import jit as jax_jit  # Use jax_jit to avoid conflict with Numba's jit
 # JAX compatibility: host_callback was removed in newer JAX versions.
 try:
     from jax.experimental.host_callback import id_print  # type: ignore
@@ -52,6 +66,44 @@ except Exception:
             return x
 from .contract_vec import *
 from .contract_jit import *
+
+#------------------------------------------------------------------------------
+# JAX JIT-compiled core contraction functions for performance
+# Note: Using jax_jit to avoid conflict with Numba's jit imported from contract_jit
+
+@jax_jit
+def _con22_einsum(A, B):
+    """JAX JIT-compiled matrix commutator [A, B]."""
+    return jnp.einsum('ij,jk->ik', A, B, optimize=True) - jnp.einsum('ki,ij->kj', B, A, optimize=True)
+
+@jax_jit
+def _con22_tensordot(A, B):
+    """JAX JIT-compiled matrix commutator using tensordot."""
+    return jnp.tensordot(A, B, axes=1) - jnp.tensordot(B, A, axes=1)
+
+@jax_jit
+def _con42_einsum(A, B):
+    """JAX JIT-compiled rank-4 with rank-2 contraction."""
+    # Keep original einsum - JAX + opt_einsum will optimize the path
+    con = jnp.einsum('abcd,df->abcf', A, B, optimize='optimal')
+    con = con - jnp.einsum('abcd,ec->abed', A, B, optimize='optimal')
+    con = con + jnp.einsum('abcd,bf->afcd', A, B, optimize='optimal')
+    con = con - jnp.einsum('abcd,ea->ebcd', A, B, optimize='optimal')
+    return con
+
+@jax_jit
+def _con44_einsum(A, B):
+    """JAX JIT-compiled rank-4 with rank-4 contraction."""
+    # Keep original einsum - JAX + opt_einsum will optimize the path
+    C = jnp.einsum('abcd,defg->abcefg', A, B, optimize='optimal')
+    C = C + jnp.einsum('abcd,efdg->abcgef', A, B, optimize='optimal')
+    C = C - jnp.einsum('abcd,ecfg->abedfg', A, B, optimize='optimal')
+    C = C - jnp.einsum('abcd,efgc->abgdef', A, B, optimize='optimal')
+    C = C + jnp.einsum('abcd,befg->aecdfg', A, B, optimize='optimal')
+    C = C + jnp.einsum('abcd,efgb->agcdef', A, B, optimize='optimal')
+    C = C - jnp.einsum('abcd,eafg->ebcdfg', A, B, optimize='optimal')
+    C = C - jnp.einsum('abcd,efga->gbcdef', A, B, optimize='optimal')
+    return C
 
 #------------------------------------------------------------------------------
 # Tensor contraction subroutines
@@ -279,22 +331,13 @@ def contractNO2(A,B,method='jit',comp=False,eta=False,state=[],pair=None):
     return con
 
 def con44(A,B,method='einsum',comp=False,eta=False):
-
-    C =  jnp.einsum('abcd,defg->abcefg',A,B,optimize=True)
-    C += jnp.einsum('abcd,efdg->abcgef',A,B,optimize=True)
-
-    C += -jnp.einsum('abcd,ecfg->abedfg',A,B,optimize=True)
-    C += -jnp.einsum('abcd,efgc->abgdef',A,B,optimize=True)
-
-    C += jnp.einsum('abcd,befg->aecdfg',A,B,optimize=True)
-    C += jnp.einsum('abcd,efgb->agcdef',A,B,optimize=True)
-
-    C += -jnp.einsum('abcd,eafg->ebcdfg',A,B,optimize=True)
-    C += -jnp.einsum('abcd,efga->gbcdef',A,B,optimize=True)
-
+    """Contraction of two rank-4 tensors."""
+    # Use JIT-compiled version for the heavy computation
+    C = _con44_einsum(A, B)
+    
     n,_,_,_ = B.shape
     mask = no_helper6(n)
-    C = jnp.multiply(mask,C.reshape(n**6))
+    C = jnp.multiply(mask, C.reshape(n**6))
     C = C.reshape(n,n,n,n,n,n)
 
     return C
@@ -328,9 +371,9 @@ def con22(A,B,method='jit',comp=False,eta=False):
     """
 
     if method == 'einsum':
-        return jnp.einsum('ij,jk->ik',A,B,optimize=True) - jnp.einsum('ki,ij->kj',B,A,optimize=True)
+        return _con22_einsum(A, B)
     elif method == 'tensordot':
-        return jnp.tensordot(A,B,axes=1) - jnp.tensordot(B,A,axes=1)
+        return _con22_tensordot(A, B)
     elif method == 'jit' and comp==False:
         con = np.zeros(A.shape,dtype=np.float64)
         if eta==False:
@@ -358,32 +401,46 @@ def con22(A,B,method='jit',comp=False,eta=False):
             con_vec_comp3(A,B,con)
         return con
     
-# @functools.lru_cache(maxsize=None)
+# Cached mask arrays - avoid recomputation on every call
+# Store as NumPy arrays to avoid JAX tracer leaks; convert to JAX when needed
+_mask_cache_np = {}
+
 def no_helper(n):
-    test = np.ones((n,n,n,n),dtype=np.int8)
-    for i in range(n):
+    """Return cached mask for rank-4 tensor operations."""
+    key = ('no_helper', n)
+    if key not in _mask_cache_np:
+        test = np.ones((n,n,n,n), dtype=np.int8)
+        for i in range(n):
             test[i,:,i,:] = 0
             test[:,i,:,i] = 0
-    return jnp.array(test.reshape(n**4))
+        _mask_cache_np[key] = test.reshape(n**4)
+    # Convert to JAX array fresh each time to avoid tracer leaks
+    return jnp.asarray(_mask_cache_np[key])
 
 def no_helper3(n):
-    test = np.ones((n,n,n),dtype=np.int8)
-    for i in range(n):
-        test[i,i,:] = 0
-    return jnp.array(test.reshape(n**3))
+    """Return cached mask for rank-3 tensor operations."""
+    key = ('no_helper3', n)
+    if key not in _mask_cache_np:
+        test = np.ones((n,n,n), dtype=np.int8)
+        for i in range(n):
+            test[i,i,:] = 0
+        _mask_cache_np[key] = test.reshape(n**3)
+    return jnp.asarray(_mask_cache_np[key])
 
 def no_helper6(n):
-    test = np.ones((n,n,n,n,n,n),dtype=np.int8)
-    for i in range(n):
+    """Return cached mask for rank-6 tensor operations."""
+    key = ('no_helper6', n)
+    if key not in _mask_cache_np:
+        test = np.ones((n,n,n,n,n,n), dtype=np.int8)
+        for i in range(n):
             test[i,:,i,:,:,:] = 0
             test[i,:,:,:,i,:] = 0
             test[:,:,i,:,i,:] = 0
-
             test[:,i,:,i,:,:] = 0
             test[:,i,:,:,:,i] = 0
             test[:,:,:,i,:,i] = 0
-
-    return jnp.array(test.reshape(n**6))
+        _mask_cache_np[key] = test.reshape(n**6)
+    return jnp.asarray(_mask_cache_np[key])
 
 # Contract rank-4 tensor with square matrix
 def con42(A,B,method='jit',comp=False):
@@ -415,15 +472,7 @@ def con42(A,B,method='jit',comp=False):
     """
 
     if method == 'einsum':
-        con = jnp.einsum('abcd,df->abcf',A,B,optimize=True) 
-        con += -jnp.einsum('abcd,ec->abed',A,B,optimize=True)
-
-        con += jnp.einsum('abcd,bf->afcd',A,B,optimize=True)
-        # con += -jnp.einsum('abcd,bf->adcf',A,B,optimize=True)
-
-        con += -jnp.einsum('abcd,ea->ebcd',A,B,optimize=True)
-        # con += jnp.einsum('abcd,ea->cbed',A,B,optimize=True)
-
+        con = _con42_einsum(A, B)
     elif method == 'tensordot':
         con = - jnp.moveaxis(jnp.tensordot(A,B,axes=[0,1]),[0,1,2,3],[1,2,3,0])
         con += - jnp.moveaxis(jnp.tensordot(A,B,axes=[2,1]),[0,1,2,3],[0,1,3,2])

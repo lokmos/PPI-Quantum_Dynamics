@@ -166,20 +166,41 @@ checkpoint_mode = os.environ.get("USE_CKPT", "0") == "1"
 if __name__ == '__main__': 
 
     startTime = datetime.now()
-    print('Start time: ', startTime)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Print header with configuration
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("═" * 70)
+    print("  Flow Equations for Many-Body Quantum Systems")
+    print("═" * 70)
+    print(f"  Start time:     {startTime.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  System:         L={L}, dim={dim}, n={n} sites")
+    print(f"  Species:        {species}")
+    print(f"  Disorder:       {dis_type}, d={dis}")
+    print(f"  Interactions:   U={Ulist}, J={J}")
+    print(f"  Method:         {method}")
+    print(f"  Flow params:    lmax={lmax}, qmax={qmax}, cutoff={cutoff}")
+    print(f"  Checkpoint:     {'ON' if checkpoint_mode else 'OFF'}")
+    print("═" * 70)
+    
     memlog("main:start")
 
     overwrite = os.environ.get("PYFLOW_OVERWRITE", "0") in ("1", "true", "True")
+    
+    total_runs = len([int(sys.argv[5])]) * len(xlist) * len(dis) * len(Ulist)
+    current_run = 0
 
     for p in [int(sys.argv[5])]:
         for x in xlist:
             for d in dis:
-                # lmax *= 1/d
-                print(d)
-                print(lmax)
                 for delta in Ulist:
+                    current_run += 1
+                    
+                    print(f"\n{'─' * 70}")
+                    print(f"  Run {current_run}/{total_runs}: d={d:.2f}, U={delta:.2f}, x={x:.2f}, p={p}")
+                    print(f"{'─' * 70}")
 
-                    # Create dictionary of parameters to pass to functions; avoids having to have too many function args
+                    # Create dictionary of parameters to pass to functions
                     params = {"n":n,"delta":delta,"J":J,"cutoff":cutoff,"dis":dis,"dsymm":dsymm,"NO_state":no_state,"lmax":lmax,"qmax":qmax,"norm":norm,"Hflow":Hflow,"method":method, "intr":intr,"dyn":dyn,"imbalance":imbalance,"species":species,
                                     "LIOM":LIOM, "dyn_MF":dyn_MF,"logflow":logflow,"dis_type":dis_type,"x":x,"tlist":tlist,"store_flow":store_flow,"ITC":ITC,
                                     "ladder":ladder,"order":order,"dim":dim,"checkpoint_mode":checkpoint_mode}
@@ -188,13 +209,15 @@ if __name__ == '__main__':
                     if overwrite or (not os.path.exists(out_h5)):
                         #-----------------------------------------------------------------
                         # Initialise Hamiltonian
+                        print("  [1/4] Initializing Hamiltonian...", end=" ", flush=True)
+                        ham_init_start = datetime.now()
                         ham = models.hamiltonian(species,dis_type,intr=intr)
                         if species == 'spinless fermion':
                             ham.build(n,dim,d,J,x,delta=delta)
                         elif species == 'spinful fermion':
                             ham.build(n,dim,d,J,x,delta_onsite=delta,delta_up=0.,delta_down=0.,dsymm=dsymm)
+                        print(f"done ({(datetime.now()-ham_init_start).total_seconds():.2f}s)")
 
-                        print(ham.H2_spinless)
                         # Initialise the number operator on the central lattice site
                         num = jnp.zeros((n,n))
                         num = num.at[n//2,n//2].set(1.0)
@@ -205,71 +228,62 @@ if __name__ == '__main__':
                         #-----------------------------------------------------------------
 
                         # Diag non-interacting system w/NumPy
-                        # print(ham.H2_spinless)
-                        startTime = datetime.now()
-                        print(jnp.sort(jnp.linalg.eigvalsh(ham.H2_spinless)))
-                        # print('NumPy diag time',datetime.now()-startTime)
+                        print("  [2/4] Computing reference eigenvalues...", end=" ", flush=True)
+                        diag_start = datetime.now()
+                        eigvals = jnp.sort(jnp.linalg.eigvalsh(ham.H2_spinless))
+                        print(f"done ({(datetime.now()-diag_start).total_seconds():.2f}s)")
 
                         #-----------------------------------------------------------------
 
                         # Diagonalise with flow equations
                         # If enabled, write memlog into repo-level test/ by default.
-                        # We set PYFLOW_MEMLOG_FILE PER RUN so different disorder strengths don't append to the same file.
                         if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True"):
                             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
                             test_dir = os.path.join(repo_root, "test")
                             os.makedirs(test_dir, exist_ok=True)
                             
-                            # 获取当前模式
-                            # NOTE: params uses 'checkpoint_mode' (not 'checkpoint')
                             is_ckpt = bool(params.get("checkpoint_mode", False))
                             mode_str = "ckpt" if is_ckpt else "original"
                             
-                            # 构造区分度高的文件名
                             log_filename = (
                                 f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}.jsonl"
                             )
                             
-                            # Close any previous memlog file handle before switching output path.
                             memlog_close()
                             os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(test_dir, log_filename)
 
+                        print("  [3/4] Running flow equations...", flush=True)
                         memlog("main:before_flow", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n), dim=int(dim))
                         flow_startTime = datetime.now()
                         flow = diag.CUT(params,ham,num,num_int)
                         flow_endTime = datetime.now()-flow_startTime
                         memlog("main:after_flow", step=p)
-
-                        # bessel = jnp.zeros(L)
-                        # for i in range(L):
-                        #     bessel = bessel.at[i].set(jnp.log10(jnp.abs(jv(jnp.abs(i-n//2),2/dis[0])**1)))
-                        # plt.plot(bessel,'x--')
-                        # plt.ylim(-4,0)
-                        # plt.show()
-                        # plt.close()
-
-                        print('Time after flow finishes: ',datetime.now()-startTime)
+                        print(f"        Flow completed in {flow_endTime.total_seconds():.2f}s")
 
                         if species == 'spinless fermion':
                             ncut = 16
                         elif species == 'spinful fermion':
                             ncut = 6
 
-                        # Diagonalise with ED (optional; requires QuSpin). Skipped by default for flow-only runs.
+                        # Diagonalise with ED (optional; requires QuSpin)
                         if ED is not None and n <= ncut:
+                            print("  [3.5/4] Running exact diagonalization (QuSpin)...", end=" ", flush=True)
+                            ed_startTime = datetime.now()
                             if dyn == True:
-                                ed_startTime = datetime.now()
                                 ed = ED(n, ham, tlist, dyn, imbalance, dim)
                                 ed_endTime = datetime.now() - ed_startTime
                                 ed_dyn = ed[1]
                             else:
-                                ed_startTime = datetime.now()
                                 ed = ED(n, ham, tlist, dyn, imbalance, dim)
                                 ed_endTime = datetime.now() - ed_startTime
                                 ed_itc = ed[1]
+                            print(f"done ({ed_endTime.total_seconds():.2f}s)")
                         else:
                             ed = np.zeros(n)
-                        print('Time after ED: ',datetime.now()-startTime)
+                            if ED is None:
+                                print("        (QuSpin not available, skipping ED)")
+                            else:
+                                print(f"        (System too large for ED: n={n} > {ncut})")
 
                         if (intr == False or n <= ncut) and ED is not None:
                             if species == 'spinless fermion':
@@ -309,6 +323,8 @@ if __name__ == '__main__':
 
                         #==============================================================
                         # Export data
+                        print("  [4/4] Saving results to HDF5...", end=" ", flush=True)
+                        save_start = datetime.now()
                         memlog("main:before_h5_write", step=p)
                         with h5py.File(out_h5, 'w') as hf:
                             hf.create_dataset('params',data=str(params))
@@ -368,19 +384,24 @@ if __name__ == '__main__':
                                 if n <= ncut:
                                     hf.create_dataset('ed_dyn', data = ed_dyn)
                         memlog("main:after_h5_write", step=p)
+                        print(f"done ({(datetime.now()-save_start).total_seconds():.2f}s)")
+                        print(f"        Output: {out_h5}")
+                    else:
+                        print(f"        ⏭  Skipping (output exists): {out_h5}")
                                         
                 gc.collect()
                 memlog("main:after_gc", step=p)
                 memlog_close()
-                print('****************')
-                print('Time taken for one run:',datetime.now()-startTime)
-                print('****************')
+                
+                run_time = datetime.now() - startTime
+                print(f"\n  ✓ Run completed in {run_time.total_seconds():.2f}s")
 
-        #plt.xscale('log')
-        #plt.legend()
-        # plt.yscale('log')
-        # plt.ylim(-0.05,0.3)
-        #plt.ylabel(r'$C(t) = \langle S^z_{L/2}(t) S^z_{L/2}(t) \rangle$')
-        #plt.xlabel(r'$t$')
-        #plt.show()
-        #plt.close()
+    # Final summary
+    total_time = datetime.now() - startTime
+    print("\n" + "═" * 70)
+    print("  COMPLETED")
+    print("═" * 70)
+    print(f"  Total runs:     {total_runs}")
+    print(f"  Total time:     {total_time}")
+    print(f"  End time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("═" * 70)

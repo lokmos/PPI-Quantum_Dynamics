@@ -91,16 +91,20 @@ def CUT(params,hamiltonian,num,num_int):
         elif dyn == False:
             if intr == True:
                 if LIOM == 'bck':
+                    # Check for JIT acceleration (applies to both modes)
+                    use_jit_flow = os.environ.get("USE_JIT_FLOW", "0") in ("1", "true", "True")
+                    jit_status = "[JIT ON]" if use_jit_flow else "[JIT OFF]"
+                    
                     if use_ckpt:
-                        # 如果开启，调用上面的优化版函数
-                        print("--- [MODE SWITCH] Using Checkpoint Optimization (Low Memory) ---")
+                        # Checkpoint mode (low memory)
+                        print(f"--- [MODE SWITCH] Checkpoint Mode (Low Memory) {jit_status} ---")
                         flow = flow_static_int_ckpt(
                             n, hamiltonian, dl, qmax, cutoff,
                             method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
                         )
                     else:
-                        # 如果关闭，调用原版函数
-                        print("--- [MODE SWITCH] Using Standard Mode (High Memory) ---")
+                        # Standard mode (high memory)
+                        print(f"--- [MODE SWITCH] Standard Mode (High Memory) {jit_status} ---")
                         flow = flow_static_int(
                             n, hamiltonian, dl, qmax, cutoff,
                             method=method, norm=norm, Hflow=Hflow, store_flow=store_flow

@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-01-06T02:53:58.402338",
+  "results": [
+    {
+      "L": 3,
+      "mode": "original",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06222128868103027
+    },
+    {
+      "L": 3,
+      "mode": "ckpt",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06273269653320312
+    },
+    {
+      "L": 4,
+      "mode": "original",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06167435646057129
+    },
+    {
+      "L": 4,
+      "mode": "ckpt",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06180429458618164
+    },
+    {
+      "L": 5,
+      "mode": "original",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.062165021896362305
+    },
+    {
+      "L": 5,
+      "mode": "ckpt",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06225156784057617
+    },
+    {
+      "L": 6,
+      "mode": "original",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.0621342658996582
+    },
+    {
+      "L": 6,
+      "mode": "ckpt",
+      "status": "error",
+      "returncode": 1,
+      "elapsed_s": 0.06151175498962402
+    }
+  ]
+}

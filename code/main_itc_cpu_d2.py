@@ -30,22 +30,34 @@ and save the output as an HDF5 file containing various different datasets.
 """
 
 import os, sys
-from psutil import cpu_count
-# Set up threading options for parallel solver
-os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number of OpenMP threads to run in parallel
-os.environ['MKL_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number of MKL threads to run in parallel
-os.environ['KMP_DUPLICATE_LIB_OK']="TRUE"                         # Necessary on some versions of OS X
-os.environ['KMP_WARNINGS'] = 'off'                                # Silence non-critical warning
 
-# JAX options - must be set BEFORE importing the JAX library
-#os.environ['CUDA_VISIBLE_DEVICES'] = str(sys.argv[5])             # Set which device to use ('' is CPU)
-# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-#os.environ['JAX_ENABLE_X64'] = 'true'                             # Enable 64-bit floats in JAX
-# from jax.config import config
-# config.update('jax_disable_jit', True)                          # Disable JIT compilation in JAX for debugging
-# config.update("jax_enable_x64", True)                           # Alternate way to enable float64 in JAX
+# -----------------------------------------------------------------------------
+# Environment configuration MUST happen before any JAX import
+# -----------------------------------------------------------------------------
 
-import jax.numpy as jnp 
+# Precision control: set PYFLOW_FLOAT32=1 to prefer float32 (lower memory).
+USE_FLOAT64 = os.environ.get('PYFLOW_FLOAT32', '0') not in ('1', 'true', 'True')
+os.environ.setdefault('JAX_ENABLE_X64', 'true' if USE_FLOAT64 else 'false')
+
+# CPU threading setup (psutil optional)
+def _get_num_cores() -> int:
+    try:
+        from psutil import cpu_count as _psutil_cpu_count  # type: ignore
+
+        n = _psutil_cpu_count(logical=False)
+        if n is None:
+            n = _psutil_cpu_count(logical=True)
+        return int(n) if n else (os.cpu_count() or 1)
+    except Exception:
+        return int(os.cpu_count() or 1)
+
+_NUM_CORES = str(_get_num_cores())
+os.environ['OMP_NUM_THREADS'] = _NUM_CORES  # OpenMP threads
+os.environ['MKL_NUM_THREADS'] = _NUM_CORES  # MKL threads
+os.environ['KMP_DUPLICATE_LIB_OK'] = "TRUE"  # Necessary on some versions of OS X
+os.environ['KMP_WARNINGS'] = 'off'  # Silence non-critical warning
+
+import jax.numpy as jnp
 import numpy as np
 #from scipy.special import jv as jv
 from datetime import datetime
@@ -60,15 +72,10 @@ try:
 except Exception:
     ED = None
 
-#import matplotlib.pyplot as plt
-# Part to change plotting system
-#import matplotlib as mpl
-#mpl.rcParams['figure.figsize'] = (12,6)
-#plt.rc('font',family='serif')
-#plt.rcParams.update({'font.size': 24})
-#plt.rc('text', usetex=True)
-#mpl.rcParams['mathtext.fontset'] = 'cm'
-#mpl.rcParams['mathtext.rm'] = 'serif'
+# Fast memory-profiling mode: we only care about allocations/peak RSS.
+# Skip ED/accuracy metrics that can fail with partial/approximate flows.
+FASTMEM = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
+
 #------------------------------------------------------------------------------  
 # Parameters
 L = int(sys.argv[1])            # Linear system size
@@ -79,7 +86,9 @@ dsymm = 'spin'                  # Type of disorder (spinful fermions only)
 Ulist = [0.1]
 # List of interaction strengths
 J = 0.5                         # Nearest-neighbour hopping amplitude
-cutoff = J*10**(-4)             # Cutoff for the off-diagonal elements to be considered zero
+# Cutoff for the off-diagonal elements to be considered zero.
+# Override from CLI by setting PYFLOW_CUTOFF (e.g. PYFLOW_CUTOFF=5e-4).
+cutoff = float(os.environ.get("PYFLOW_CUTOFF", J * 10 ** (-4)))
 # By default, use the CLI disorder strength (matches main_itc_cpu.py behavior).
 # If you want to sweep d=1..6, set PYFLOW_SWEEP_D=1.
 if os.environ.get("PYFLOW_SWEEP_D", "0") in ("1", "true", "True"):
@@ -123,7 +132,7 @@ LIOM = 'bck'                    # Compute LIOMs with forward ('fwd') or backward
                                 # in the initial basis into the diagonal basis; backward does the reverse
 dyn_MF = True                   # Mean-field decoupling for dynamics (used only if dyn=True)
 logflow = True                  # Use logarithmically spaced steps in flow time
-store_flow = False              # Store the full flow of the Hamiltonian and LIOMs
+store_flow = True              # Store the full flow of the Hamiltonian and LIOMs
 dis_type = str(sys.argv[2])     # Options: 'random', 'QPgolden', 'QPsilver', 'QPbronze', 'QPrandom', 'linear', 'curved', 'prime'
                                 # Also contains 'test' and 'QPtest', potentials that do not change from run to run
 xlist = [1.]
@@ -132,9 +141,9 @@ if intr == False:               # Zero the interactions if set to False (for ED 
     delta = 0
 if dis_type != 'curved':
     xlist = [0.0]
-if (species == 'spinless fermion' and n > 12) or (species == 'spinful fermion' and n > 6) or qmax > 2000:
-    print('SETTING store_flow = False DUE TO TOO MANY VARIABLES AND/OR FLOW TIME STEPS')
-    store_flow = False
+# if (species == 'spinless fermion' and n > 12) or (species == 'spinful fermion' and n > 6) or qmax > 2000:
+#     print('SETTING store_flow = False DUE TO TOO MANY VARIABLES AND/OR FLOW TIME STEPS')
+#     store_flow = False
 
 # Define list of timesteps for non-equilibrium dynamics
 # Only used if 'dyn = True'
@@ -155,10 +164,23 @@ if norm == True and n%2 != 0:
 if ITC == True:
     store_flow = False
 
-checkpoint_mode = os.environ.get("USE_CKPT", "0") == "1"
-# if species == 'spinful fermion' and norm == True:
-#     print('Normal ordering not implemented for spinful fermions.')
-#     norm = False
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECKPOINT MODE PARSING (Modified)
+# ─────────────────────────────────────────────────────────────────────────────
+env_ckpt = os.environ.get("USE_CKPT", "0").lower()
+if env_ckpt == "hybrid":
+    checkpoint_mode = "hybrid"      # <--- 新增
+    ckpt_status_str = "ON (Hybrid)" # <--- 新增
+elif env_ckpt == "recursive":
+    checkpoint_mode = "recursive"
+    ckpt_status_str = "ON (Recursive)"
+elif env_ckpt in ("1", "true", "on"):
+    checkpoint_mode = True
+    ckpt_status_str = "ON (Linear)"
+else:
+    checkpoint_mode = False
+    ckpt_status_str = "OFF"
+
 #==============================================================================
 # Run program
 #==============================================================================
@@ -180,7 +202,7 @@ if __name__ == '__main__':
     print(f"  Interactions:   U={Ulist}, J={J}")
     print(f"  Method:         {method}")
     print(f"  Flow params:    lmax={lmax}, qmax={qmax}, cutoff={cutoff}")
-    print(f"  Checkpoint:     {'ON' if checkpoint_mode else 'OFF'}")
+    print(f"  Checkpoint:     {checkpoint_mode}")
     print("═" * 70)
     
     memlog("main:start")
@@ -237,16 +259,36 @@ if __name__ == '__main__':
 
                         # Diagonalise with flow equations
                         # If enabled, write memlog into repo-level test/ by default.
+                        # In fast memory-profiling mode (PYFLOW_FASTMEM=1), write into test/fast/<mode>/
+                        # to avoid overwriting baseline results.
                         if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True"):
                             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                            test_dir = os.path.join(repo_root, "test")
+                            
+                            # Determine mode string for directory and filename
+                            # Prioritize params (from env parsing above)
+                            if params["checkpoint_mode"] == "hybrid":
+                                mode_str = "hybrid"  # <--- 新增
+                            elif params["checkpoint_mode"] == "recursive":
+                                mode_str = "recursive"
+                            elif params["checkpoint_mode"] is True:
+                                mode_str = "ckpt"
+                            else:
+                                mode_str = "original"
+                            
+                            fastmem = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
+
+                            # Create subdirectory:
+                            # - normal: test/<mode>/
+                            # - fastmem: test/fast/<mode>/
+                            if fastmem:
+                                test_dir = os.path.join(repo_root, "test", "fast", mode_str)
+                            else:
+                                test_dir = os.path.join(repo_root, "test", mode_str)
                             os.makedirs(test_dir, exist_ok=True)
                             
-                            is_ckpt = bool(params.get("checkpoint_mode", False))
-                            mode_str = "ckpt" if is_ckpt else "original"
-                            
                             log_filename = (
-                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}.jsonl"
+                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}"
+                                f"{'-fastmem' if fastmem else ''}.jsonl"
                             )
                             
                             memlog_close()
@@ -266,7 +308,7 @@ if __name__ == '__main__':
                             ncut = 6
 
                         # Diagonalise with ED (optional; requires QuSpin)
-                        if ED is not None and n <= ncut:
+                        if (not FASTMEM) and ED is not None and n <= ncut:
                             print("  [3.5/4] Running exact diagonalization (QuSpin)...", end=" ", flush=True)
                             ed_startTime = datetime.now()
                             if dyn == True:
@@ -282,10 +324,12 @@ if __name__ == '__main__':
                             ed = np.zeros(n)
                             if ED is None:
                                 print("        (QuSpin not available, skipping ED)")
+                            elif FASTMEM:
+                                print("        (FASTMEM enabled, skipping ED/accuracy checks)")
                             else:
                                 print(f"        (System too large for ED: n={n} > {ncut})")
 
-                        if (intr == False or n <= ncut) and ED is not None:
+                        if (not FASTMEM) and (intr == False or n <= ncut) and ED is not None:
                             if species == 'spinless fermion':
                                 flevels = utility.flow_levels(n,flow,intr,order)
                             elif species == 'spinful fermion':
@@ -297,14 +341,18 @@ if __name__ == '__main__':
                             flevels=np.zeros(n)
                             ed=np.zeros(n)
 
-                        if (intr == False or n <= ncut) and ED is not None:
+                        if (not FASTMEM) and (intr == False or n <= ncut) and ED is not None:
                             lsr = utility.level_stat(flevels)
                             lsr2 = utility.level_stat(ed)
 
                             errlist = np.zeros(len(ed))
-                            for i in range(len(ed)):
-                                if np.round(ed[i],10)!=0.:
-                                    errlist[i] = np.abs((ed[i]-flevels[i])/ed[i])
+                            if flevels is None or len(flevels) == 0:
+                                print("***** WARNING *****: empty flow levels (skipping error metric)")
+                            else:
+                                m = min(len(ed), len(flevels))
+                                for i in range(m):
+                                    if np.round(ed[i],10)!=0.:
+                                        errlist[i] = np.abs((ed[i]-flevels[i])/ed[i])
 
                             print('***** ERROR *****: ', np.median(errlist))  
 
@@ -326,12 +374,21 @@ if __name__ == '__main__':
                         print("  [4/4] Saving results to HDF5...", end=" ", flush=True)
                         save_start = datetime.now()
                         memlog("main:before_h5_write", step=p)
+                        def _h5_put(group, name, data, **kwargs):
+                            """Create/replace dataset safely (idempotent reruns)."""
+                            if name in group:
+                                del group[name]
+                            group.create_dataset(name, data=data, **kwargs)
+
                         with h5py.File(out_h5, 'w') as hf:
-                            hf.create_dataset('params',data=str(params))
-                            hf.create_dataset('fe_runtime',data=str(flow_endTime))
-                            hf.create_dataset('trunc_err',data=flow["truncation_err"])
-                            hf.create_dataset('dl_list',data=flow["dl_list"])
-                            hf.create_dataset('H2_diag',data=flow["H0_diag"])
+                            _h5_put(hf, 'params', str(params))
+                            _h5_put(hf, 'fe_runtime', str(flow_endTime))
+                            if "truncation_err" in flow:
+                                _h5_put(hf, 'trunc_err', flow["truncation_err"])
+                            if "dl_list" in flow:
+                                _h5_put(hf, 'dl_list', flow["dl_list"])
+                            if "H0_diag" in flow:
+                                _h5_put(hf, 'H2_diag', flow["H0_diag"])
 
                             if species == 'spinless fermion':
                                 hf.create_dataset('H2_initial',data=ham.H2_spinless)
@@ -339,16 +396,18 @@ if __name__ == '__main__':
                                 hf.create_dataset('H2_up',data=ham.H2_spinup)
                                 hf.create_dataset('H2_dn',data=ham.H2_spindown)
 
-                            if ED is not None and n <= ncut:
-                                hf.create_dataset('ed_runtime',data=str(ed_endTime))
-                                hf.create_dataset('flevels', data = flevels,compression='gzip', compression_opts=9)
-                                hf.create_dataset('ed', data = ed, compression='gzip', compression_opts=9)
-                                hf.create_dataset('lsr', data = [lsr,lsr2])
-                                hf.create_dataset('err',data = errlist)
+                            if (not FASTMEM) and ED is not None and n <= ncut:
+                                _h5_put(hf, 'ed_runtime', str(ed_endTime))
+                                _h5_put(hf, 'flevels', flevels, compression='gzip', compression_opts=9)
+                                _h5_put(hf, 'ed', ed, compression='gzip', compression_opts=9)
+                                _h5_put(hf, 'lsr', [lsr,lsr2])
+                                _h5_put(hf, 'err', errlist)
                                 if store_flow == True:
-                                    hf.create_dataset('flow2',data=flow["flow2"])
-                                    hf.create_dataset('flow4',data=flow["flow4"])
-                                    hf.create_dataset('dl_list',data=flow["dl_list"])
+                                    # Some modes may not provide full flow storage.
+                                    if "flow2" in flow:
+                                        _h5_put(hf, 'flow2', flow["flow2"])
+                                    if "flow4" in flow:
+                                        _h5_put(hf, 'flow4', flow["flow4"])
                             if intr == True:
                                     liom_int = flow.get("lbits", flow.get("LIOM Interactions", None))
                                     if liom_int is not None:
@@ -372,7 +431,7 @@ if __name__ == '__main__':
                                         # hf.create_dataset('nt_list',data = flow["nt_list"])
                                         hf.create_dataset('itc',data=flow["itc"])
                                         hf.create_dataset('itc_nonint',data=flow["itc_nonint"])
-                                        if ED is not None and n <= ncut:
+                                        if (not FASTMEM) and ED is not None and n <= ncut:
                                             hf.create_dataset('ed_itc',data=ed_itc)
                                     # hf.create_dataset('inv',data=flow["Invariant"])
                             if dyn == True:
@@ -381,7 +440,7 @@ if __name__ == '__main__':
                                     hf.create_dataset('imbalance',data=flow["Imbalance"])
                                 else:
                                     hf.create_dataset('flow_dyn', data = flow["Density Dynamics"])
-                                if n <= ncut:
+                                if (not FASTMEM) and n <= ncut:
                                     hf.create_dataset('ed_dyn', data = ed_dyn)
                         memlog("main:after_h5_write", step=p)
                         print(f"done ({(datetime.now()-save_start).total_seconds():.2f}s)")

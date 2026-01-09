@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cython compiled files
+*.so
+*.c
+!dyn_cython.pyx
+*.o
+*.html
+build/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files and output
+*.h5
+*.hdf5
+pyflow_out/
+
+# Test output and logs
+# (No longer ignoring the whole test/ directory here)
+
+# PDF files (documentation, papers)
+*.pdf
+
+# Images
+*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Cython generated files (specific)
+code/core/dyn_cython.c
+code/core/dyn_cython.html
+
+# (Do not ignore .gitignore itself)

@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-01-06T08:03:40.258085",
+  "results": [
+    {
+      "L": 3,
+      "n": 9,
+      "mode": "jit",
+      "status": "ok",
+      "elapsed_s": 16.17589282989502,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L3-d1.00-O4-x0.00-Jz0.10-p0-jit.jsonl",
+      "error": "File not found: /root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L3-d1.00-O4-x0.00-Jz0.10-p0-jit.jsonl"
+    }
+  ]
+}

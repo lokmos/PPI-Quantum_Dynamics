@@ -1,0 +1,110 @@
+{
+  "timestamp": "2026-01-06T16:47:28.589416",
+  "results": [
+    {
+      "L": 3,
+      "n": 9,
+      "mode": "original",
+      "status": "ok",
+      "elapsed_s": 34.44746470451355,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L3-d1.00-O4-x0.00-Jz0.10-p0-original.jsonl",
+      "entries": 92,
+      "rss_min_mb": 442.30078125,
+      "rss_max_mb": 1610.4375,
+      "rss_peak_mb": 1610.4375,
+      "peak_tag": "main:after_h5_write",
+      "peak_step": 0
+    },
+    {
+      "L": 3,
+      "n": 9,
+      "mode": "ckpt",
+      "status": "ok",
+      "elapsed_s": 42.61063194274902,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L3-d1.00-O4-x0.00-Jz0.10-p0-ckpt.jsonl",
+      "entries": 94,
+      "rss_min_mb": 442.578125,
+      "rss_max_mb": 698.078125,
+      "rss_peak_mb": 698.078125,
+      "peak_tag": "main:after_h5_write",
+      "peak_step": 0
+    },
+    {
+      "L": 4,
+      "n": 16,
+      "mode": "original",
+      "status": "ok",
+      "elapsed_s": 482.6559422016144,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L4-d1.00-O4-x0.00-Jz0.10-p0-original.jsonl",
+      "entries": 102,
+      "rss_min_mb": 443.60546875,
+      "rss_max_mb": 1574.46875,
+      "rss_peak_mb": 1574.46875,
+      "peak_tag": "flow:step",
+      "peak_step": 900
+    },
+    {
+      "L": 4,
+      "n": 16,
+      "mode": "ckpt",
+      "status": "ok",
+      "elapsed_s": 984.5056412220001,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L4-d1.00-O4-x0.00-Jz0.10-p0-ckpt.jsonl",
+      "entries": 104,
+      "rss_min_mb": 443.34765625,
+      "rss_max_mb": 1063.89453125,
+      "rss_peak_mb": 1063.89453125,
+      "peak_tag": "main:after_h5_write",
+      "peak_step": 0
+    },
+    {
+      "L": 5,
+      "n": 25,
+      "mode": "original",
+      "status": "ok",
+      "elapsed_s": 3184.0088772773743,
+      "memlog_file": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/memlog-dim2-L5-d1.00-O4-x0.00-Jz0.10-p0-original.jsonl",
+      "entries": 104,
+      "rss_min_mb": 444.50390625,
+      "rss_max_mb": 5375.4140625,
+      "rss_peak_mb": 5375.4140625,
+      "peak_tag": "flow:step",
+      "peak_step": 850
+    },
+    {
+      "L": 5,
+      "mode": "ckpt",
+      "status": "timeout"
+    },
+    {
+      "L": 6,
+      "mode": "original",
+      "status": "timeout"
+    },
+    {
+      "L": 6,
+      "mode": "ckpt",
+      "status": "timeout"
+    },
+    {
+      "L": 7,
+      "mode": "original",
+      "status": "timeout"
+    },
+    {
+      "L": 7,
+      "mode": "ckpt",
+      "status": "timeout"
+    },
+    {
+      "L": 8,
+      "mode": "original",
+      "status": "timeout"
+    },
+    {
+      "L": 8,
+      "mode": "ckpt",
+      "status": "timeout"
+    }
+  ]
+}

@@ -28,7 +28,11 @@ This file contains all of the matrix/tensor contraction routines used to compute
 
 import os, functools
 import numpy as np
-from psutil import cpu_count
+try:
+    # Optional: provides physical-core counts; fall back if unavailable.
+    from psutil import cpu_count  # type: ignore
+except Exception:  # pragma: no cover
+    from os import cpu_count  # type: ignore
 
 # Set up threading options for parallel solver
 _NUM_CORES = str(int(cpu_count(logical=False)))
@@ -64,8 +68,22 @@ except Exception:
 
         def id_print(x, what=None, **kwargs):  # type: ignore
             return x
-from .contract_vec import *
 from .contract_jit import *
+
+# NOTE:
+# `contract_vec` (Numba guvectorize kernels) is extremely expensive to import/compile.
+# Most runs use method='tensordot' or 'jit', so we lazy-import vectorized kernels only
+# when method == 'vec' is requested.
+_VEC_IMPORTED = False
+
+def _ensure_vec_imported():
+    global _VEC_IMPORTED
+    if _VEC_IMPORTED:
+        return
+    from . import contract_vec as _contract_vec  # heavy import (Numba compile)
+    # Export symbols into this module's global namespace to preserve existing call sites.
+    globals().update({k: getattr(_contract_vec, k) for k in dir(_contract_vec) if not k.startswith("_")})
+    _VEC_IMPORTED = True
 
 #------------------------------------------------------------------------------
 # JAX JIT-compiled core contraction functions for performance
@@ -111,6 +129,8 @@ def _con44_einsum(A, B):
 # General contraction function
 def contract(A,B,method='jit',comp=False,eta=False,pair=None):
     """ General contract function: gets shape and calls appropriate contraction function. """
+    if method == 'vec':
+        _ensure_vec_imported()
     # A = A.astype(np.float64)
     # B = B.astype(np.float64)
     if A.ndim == B.ndim == 2:

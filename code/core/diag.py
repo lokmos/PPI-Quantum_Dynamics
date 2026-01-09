@@ -62,19 +62,49 @@ def CUT(params,hamiltonian,num,num_int):
     order = params["order"]
     dim = params["dim"]
 
-    # Unified checkpoint switch:
-    # - Preferred key: params["checkpoint_mode"] (bool)
-    # - Backwards-compatible key: params["checkpoint"] (bool)
-    # - Env override: USE_CKPT=1 forces checkpoint_mode on
-    use_ckpt = bool(params.get("checkpoint_mode", params.get("checkpoint", False)))
-    if os.environ.get("USE_CKPT", "0") in ("1", "true", "True"):
-        use_ckpt = True
+    # Unified checkpoint switch logic:
+    # Checkpoint Mode Parsing:
+    # - "recursive" -> Recursive Checkpointing (O(log N) Memory)
+    # - "1"/"True"/True -> Linear Checkpointing (O(N/K) Memory)
+    # - "0"/"False"/False -> Original (O(N) Memory)
+    
+    ckpt_param = params.get("checkpoint_mode", params.get("checkpoint", False))
+    env_ckpt = os.environ.get("USE_CKPT", "0").lower()
+
+    # Determine mode priority: Env Var > Params
+    # Supported:
+    # - USE_CKPT=hybrid|recursive|1|0 (also accepts true/false/on/off)
+    if env_ckpt == "hybrid":
+        checkpoint_mode = "hybrid"
+    elif env_ckpt == "recursive":
+        checkpoint_mode = "recursive"
+    elif env_ckpt in ("1", "true", "on"):
+        checkpoint_mode = True
+    elif env_ckpt in ("0", "false", "off"):
+        # If env is explicitly false, check params
+        ckpt_param_l = str(ckpt_param).lower()
+        if ckpt_param_l in ("hybrid",):
+            checkpoint_mode = "hybrid"
+        elif ckpt_param_l in ("recursive",):
+            checkpoint_mode = "recursive"
+        else:
+            checkpoint_mode = bool(ckpt_param)
+    else:
+        # Default fallback: allow params to select string modes too
+        ckpt_param_l = str(ckpt_param).lower()
+        if ckpt_param_l in ("hybrid",):
+            checkpoint_mode = "hybrid"
+        elif ckpt_param_l in ("recursive",):
+            checkpoint_mode = "recursive"
+        else:
+            checkpoint_mode = bool(ckpt_param)
 
     if logflow == False:
             dl = np.linspace(0,lmax,qmax,endpoint=True)
     elif logflow == True:
         print('Warning: careful choices of qmax and lmax required for log flow.')
         dl = np.logspace(np.log10(0.001), np.log10(lmax),qmax,endpoint=True,base=10)
+        
     if hamiltonian.species == 'spinless fermion':
         if ITC == True:
             flow = flow_int_ITC(n,hamiltonian,dl,qmax,cutoff,tlist,method=method,norm=norm,Hflow=Hflow,store_flow=store_flow)
@@ -91,19 +121,32 @@ def CUT(params,hamiltonian,num,num_int):
         elif dyn == False:
             if intr == True:
                 if LIOM == 'bck':
-                    # Check for JIT acceleration (applies to both modes)
+                    # Check for JIT acceleration (applies to all modes)
                     use_jit_flow = os.environ.get("USE_JIT_FLOW", "0") in ("1", "true", "True")
                     jit_status = "[JIT ON]" if use_jit_flow else "[JIT OFF]"
-                    
-                    if use_ckpt:
-                        # Checkpoint mode (low memory)
-                        print(f"--- [MODE SWITCH] Checkpoint Mode (Low Memory) {jit_status} ---")
+
+                    if str(checkpoint_mode).lower() == "hybrid":
+                        print(f"--- [MODE SWITCH] Hybrid Mode (Recursive + Quantized) {jit_status} ---")
+                        flow = flow_static_int_hybrid(
+                            n, hamiltonian, dl, qmax, cutoff,
+                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                        )
+                    elif str(checkpoint_mode).lower() == "recursive":
+                        # Recursive Checkpoint mode (Log memory)
+                        print(f"--- [MODE SWITCH] Recursive Checkpoint Mode (Log Memory) {jit_status} ---")
+                        flow = flow_static_int_recursive(
+                            n, hamiltonian, dl, qmax, cutoff,
+                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                        )
+                    elif checkpoint_mode is True:
+                        # Linear Checkpoint mode (Low memory)
+                        print(f"--- [MODE SWITCH] Linear Checkpoint Mode (Low Memory) {jit_status} ---")
                         flow = flow_static_int_ckpt(
                             n, hamiltonian, dl, qmax, cutoff,
                             method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
                         )
                     else:
-                        # Standard mode (high memory)
+                        # Standard mode (High memory)
                         print(f"--- [MODE SWITCH] Standard Mode (High Memory) {jit_status} ---")
                         flow = flow_static_int(
                             n, hamiltonian, dl, qmax, cutoff,
@@ -119,7 +162,6 @@ def CUT(params,hamiltonian,num,num_int):
         return flow
     else:
         print('ERROR: Unknown type of particle.')
-
 
 # @jit(nopython=True,parallel=True,fastmath=True,cache=True)
 # def cut(y,n,cutoff,indices):

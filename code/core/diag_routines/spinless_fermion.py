@@ -77,6 +77,141 @@ from scipy.integrate import ode as ode_np
 from jax.numpy.linalg import norm as frn
 from ..memlog import memlog
 
+# ==============================================================================
+#  Fast memory-profiling mode (skip expensive ODEs, keep allocations realistic)
+# ==============================================================================
+def _fastmem_enabled() -> bool:
+    return os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
+
+def _fastmem_fwd_steps() -> int:
+    """How many REAL forward flow steps to run (per user request)."""
+    try:
+        return int(os.environ.get("PYFLOW_FASTMEM_FWD_STEPS", "50"))
+    except Exception:
+        return 50
+
+def _fastmem_store_steps() -> int:
+    """
+    How many snapshots worth of *storage* to allocate in fastmem mode for linear extrapolation.
+    Keep this small to allow large L (storage per snapshot is O(n^4)).
+    """
+    try:
+        return int(os.environ.get("PYFLOW_FASTMEM_STORE_STEPS", "2"))
+    except Exception:
+        return 2
+
+def _fastmem_ode_tol() -> float:
+    """Looser tolerances to keep the short run fast."""
+    try:
+        return float(os.environ.get("PYFLOW_FASTMEM_ODE_TOL", "1e-2"))
+    except Exception:
+        return 1e-2
+
+def _fastmem_steps() -> int:
+    # Use the same default as checkpoint/base-case for fair comparisons
+    try:
+        return int(os.environ.get("PYFLOW_FASTMEM_STEPS", os.environ.get("PYFLOW_BASE_CASE_STEPS", "20")))
+    except Exception:
+        return 20
+
+def _fastmem_ckpt_step() -> int:
+    try:
+        return int(os.environ.get("PYFLOW_FASTMEM_CKPT_STEP", "20"))
+    except Exception:
+        return 20
+
+def _fastmem_touch(arr: np.ndarray) -> None:
+    """
+    Ensure RSS reflects the allocation. On Linux, some allocations may be lazily committed.
+    Touching one element per ~page is enough, but for simplicity we write a single value.
+    """
+    if arr.size:
+        arr.reshape(-1)[0] = arr.reshape(-1)[0]
+
+def _fastmem_ode_step(h2, hint, t0: float, t1: float, rtol: float, atol: float, method: str = "tensordot"):
+    """
+    One REAL forward step that triggers the same contraction kernels as the true flow,
+    but avoids jax.experimental.ode.odeint (which can tracer-leak in some configs).
+
+    We use a simple explicit Euler step:
+      H(t1) = H(t0) + (t1 - t0) * dH/dl|_{t0}
+    This is NOT for accuracy; it's for fast/robust peak-memory profiling.
+    """
+    dl = float(t1 - t0)
+    dH2, dH4 = int_ode([h2, hint], t0, method=method, norm=False, Hflow=True)
+    return h2 + dl * dH2, hint + dl * dH4
+
+# ==============================================================================
+#  [新增] 算法内存审计工具 (Algorithmic Memory Auditor)
+# ==============================================================================
+class AlgorithmicMemoryTracker:
+    """
+    白盒内存追踪器：
+    只统计核心算法产生的关键数据结构（Hamiltonian快照、轨迹Buffer等）的大小。
+    排除 Python 对象头、列表开销、JAX 预分配和操作系统底噪。
+    """
+    def __init__(self, mode_name="Unknown"):
+        self.mode = mode_name
+        self.current_bytes = 0
+        self.peak_bytes = 0
+        self.peak_step = 0
+        self.active_handles = {}
+        self.counter = 0
+
+    def get_size(self, obj):
+        """计算 JAX array 或 Numpy array 的纯数据大小"""
+        if obj is None: return 0
+        # 处理 list/tuple 的递归情况 (针对 [(h2, hint), ...] 这种结构)
+        if isinstance(obj, (list, tuple)):
+            return sum(self.get_size(x) for x in obj)
+        if hasattr(obj, 'nbytes'): 
+            return obj.nbytes
+        return 0
+
+    def alloc(self, obj, description=""):
+        """记录内存分配"""
+        size = self.get_size(obj)
+        self.current_bytes += size
+        if self.current_bytes > self.peak_bytes:
+            self.peak_bytes = self.current_bytes
+        
+        handle_id = self.counter
+        self.active_handles[handle_id] = size
+        self.counter += 1
+        return handle_id
+
+    def free(self, handle_id):
+        """记录内存释放"""
+        if handle_id in self.active_handles:
+            self.current_bytes -= self.active_handles[handle_id]
+            del self.active_handles[handle_id]
+
+    def report(self):
+        peak_mb = self.peak_bytes / (1024 * 1024)
+        print(f"\n{'='*60}")
+        print(f"  [AUDIT REPORT: {self.mode}]")
+        print(f"  Algorithmic Peak Memory: {peak_mb:.4f} MB")
+        print(f"  (Theoretical pure data cost, excluding overhead)")
+        print(f"{'='*60}\n")
+        return peak_mb
+
+def compress_state(h2, hint):
+    """
+    [量化+Offload] 将 JAX 数组转换为纯 Numpy 数组 (float16)。
+    作用：
+    1. 斩断 JAX 计算图引用，防止内存泄漏。
+    2. 使用紧凑的 CPU 内存存储，避开 JAX 预分配机制。
+    """
+    # np.array() 会强制将数据从 JAX(设备端) 拉取到 CPU(主机端)
+    # 这一步至关重要！
+    h2_cpu = np.array(h2, dtype=np.float16)
+    hint_cpu = np.array(hint, dtype=np.float16)
+    return h2_cpu, hint_cpu
+
+def decompress_state(h2_np, hint_np):
+    """[Offload] 将 Numpy 数组转回 JAX 数组 (float64) 用于计算"""
+    return jnp.array(h2_np, dtype=jnp.float64), jnp.array(hint_np, dtype=jnp.float64)
+
 # Optional memory logging (disabled by default).
 def _mem_every() -> int:
     try:
@@ -1614,6 +1749,65 @@ def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hfl
             the LIOM on central site ("LIOM") and the value of the second invariant of the flow ("Invariant").
     
     """
+    # Fast memory profiling mode: allocate the dominant buffers but skip expensive flow ODEs.
+    # This is intended for measuring peak memory scaling, not correctness.
+    if _fastmem_enabled():
+        T_total = len(dl_list)
+        fwd_steps = min(_fastmem_fwd_steps(), max(0, T_total - 1))
+        tol = _fastmem_ode_tol()
+        rtol = tol
+        atol = tol
+        store_steps = min(_fastmem_store_steps(), max(1, T_total))
+        # Use float32 for storage (this file sets JAX_ENABLE_X64=false at import time)
+        dtype = np.float32
+
+        memlog("fast:before_storage", step=0, mode="original", T_total=T_total, fwd_steps=fwd_steps, store_steps=store_steps)
+
+        # Storage allocation (only store_steps snapshots to enable linear extrapolation)
+        if store_flow:
+            flow2 = np.zeros((store_steps, n, n), dtype=dtype)
+            flow4 = np.zeros((store_steps, n, n, n, n), dtype=dtype)
+            _fastmem_touch(flow2); _fastmem_touch(flow4)
+        memlog("fast:after_storage_k", step=0, mode="original", T_total=T_total, store_steps=store_steps)
+
+        # Run a short REAL forward flow to include contraction/odeint temporary peaks.
+        H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+        curr_h2 = jnp.array(H2)
+        curr_hint = jnp.array(Hint)
+        if store_flow and store_steps > 0:
+            flow2[0] = np.array(curr_h2, dtype=dtype)
+            flow4[0] = np.array(curr_hint, dtype=dtype)
+
+        for k in range(1, fwd_steps + 1):
+            curr_h2, curr_hint = _fastmem_ode_step(curr_h2, curr_hint, float(dl_list[k - 1]), float(dl_list[k]), rtol, atol, method=method)
+            if store_flow and k < store_steps:
+                flow2[k] = np.array(curr_h2, dtype=dtype)
+                flow4[k] = np.array(curr_hint, dtype=dtype)
+            if k == fwd_steps:
+                memlog("fast:after_transient_step", step=k, mode="original", T_total=T_total, fwd_steps=fwd_steps)
+
+        # Final operators (one copy)
+        H0_diag = np.zeros((n, n), dtype=dtype)
+        Hint2 = np.zeros((n, n, n, n), dtype=dtype)
+        liom2 = np.zeros((n, n), dtype=dtype)
+        liom4 = np.zeros((n, n, n, n), dtype=dtype)
+        memlog("fast:after_flow", step=fwd_steps + 1, mode="original", T_total=T_total)
+
+        out = {
+            "H0_diag": H0_diag,
+            "Hint": Hint2,
+            "LIOM2": liom2,
+            "LIOM4": liom4,
+            "LIOM2_FWD": liom2,
+            "LIOM4_FWD": liom4,
+            "LIOM Interactions": np.zeros(max(n - 1, 0), dtype=dtype),
+            "Invariant": 0.0,
+            "dl_list": np.array(dl_list),
+            "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        }
+        # Do NOT return flow2/flow4 in fastmem; we only care about peak memory, not storing results.
+        return out
+
     H2,Hint = hamiltonian.H2_spinless,hamiltonian.H4_spinless
 
     # Number of intermediate setps specified for the solver to use
@@ -3415,6 +3609,84 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
     """
     针对大系统优化的版本：使用 Checkpointing (检查点) 策略。
     """
+    # Fast memory profiling mode: emulate checkpoint storage + ONE backward segment buffer.
+    # This captures the peak from checkpoint persistence + segment replay buffer with a SHORT real forward run.
+    if _fastmem_enabled():
+        T_total = len(dl_list)
+        ckpt_step = _fastmem_ckpt_step()
+        seg_len = _fastmem_steps()
+        fwd_steps = min(_fastmem_fwd_steps(), max(0, T_total - 1))
+        tol = _fastmem_ode_tol()
+        rtol = tol
+        atol = tol
+        store_steps = min(_fastmem_store_steps(), max(1, T_total))
+        dtype = np.float32
+
+        memlog("fast:before_storage", step=0, mode="ckpt", T_total=T_total, fwd_steps=fwd_steps, store_steps=store_steps, ckpt_step=ckpt_step, bck_steps=seg_len)
+
+        # Persistent checkpoint storage (only for store_steps range; will extrapolate to T_total)
+        num_ckpts = int(np.ceil(store_steps / ckpt_step)) + 1
+        ckpt2 = np.zeros((num_ckpts, n, n), dtype=dtype)
+        ckpt4 = np.zeros((num_ckpts, n, n, n, n), dtype=dtype)
+        _fastmem_touch(ckpt2)
+        _fastmem_touch(ckpt4)
+        memlog("fast:after_storage_k", step=0, mode="ckpt", T_total=T_total, store_steps=store_steps, ckpt_step=ckpt_step)
+
+        # Run a SHORT REAL forward flow, populating sparse checkpoints only (like ckpt).
+        H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+        curr_h2 = jnp.array(H2)
+        curr_hint = jnp.array(Hint)
+        ckpt_idx = 0
+        ckpt2[ckpt_idx] = np.array(curr_h2, dtype=dtype)
+        ckpt4[ckpt_idx] = np.array(curr_hint, dtype=dtype)
+        ckpt_idx += 1
+        for k in range(1, fwd_steps + 1):
+            curr_h2, curr_hint = _fastmem_ode_step(curr_h2, curr_hint, float(dl_list[k - 1]), float(dl_list[k]), rtol, atol, method=method)
+            if k % ckpt_step == 0 and ckpt_idx < num_ckpts:
+                ckpt2[ckpt_idx] = np.array(curr_h2, dtype=dtype)
+                ckpt4[ckpt_idx] = np.array(curr_hint, dtype=dtype)
+                ckpt_idx += 1
+            if k == fwd_steps:
+                memlog("fast:after_transient_step", step=k, mode="ckpt", T_total=T_total, fwd_steps=fwd_steps)
+
+        # One segment replay buffer (dominant transient peak during backward)
+        seg2 = np.zeros((seg_len, n, n), dtype=dtype)
+        seg4 = np.zeros((seg_len, n, n, n, n), dtype=dtype)
+        _fastmem_touch(seg2)
+        _fastmem_touch(seg4)
+        memlog("fast:after_bck_alloc", step=0, mode="ckpt", bck_steps=seg_len, ckpt_step=ckpt_step)
+
+        # Do ONE real segment recompute to include temporaries (compute-heavy but only seg_len steps).
+        temp_h2 = jnp.array(ckpt2[max(0, ckpt_idx - 1)])
+        temp_hint = jnp.array(ckpt4[max(0, ckpt_idx - 1)])
+        start = max(0, (fwd_steps // ckpt_step) * ckpt_step)
+        end = min(start + seg_len, T_total - 1)
+        for j, k in enumerate(range(start, end)):
+            seg2[j] = np.array(temp_h2, dtype=dtype)
+            seg4[j] = np.array(temp_hint, dtype=dtype)
+            temp_h2, temp_hint = _fastmem_ode_step(temp_h2, temp_hint, float(dl_list[k]), float(dl_list[k + 1]), rtol, atol, method=method)
+        memlog("fast:after_bck_compute", step=0, mode="ckpt", bck_steps=seg_len)
+
+        # Final operators (one copy)
+        H0_diag = np.zeros((n, n), dtype=dtype)
+        Hint2 = np.zeros((n, n, n, n), dtype=dtype)
+        liom2 = np.zeros((n, n), dtype=dtype)
+        liom4 = np.zeros((n, n, n, n), dtype=dtype)
+        memlog("fast:after_flow", step=0, mode="ckpt", T_total=T_total)
+
+        return {
+            "H0_diag": H0_diag,
+            "Hint": Hint2,
+            "LIOM Interactions": np.zeros(max(n - 1, 0), dtype=dtype),
+            "LIOM2": liom2,
+            "LIOM4": liom4,
+            "LIOM2_FWD": liom2,
+            "LIOM4_FWD": liom4,
+            "Invariant": 0.0,
+            "dl_list": np.array(dl_list),
+            "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        }
+
     H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
 
     # === 配置参数 ===
@@ -3592,4 +3864,452 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
     
     return output
 
+
+def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='tensordot', norm=False, Hflow=False, store_flow=False):
+    """
+    [算法优化] 递归检查点 (Recursive/Binomial Checkpointing)
+    
+    核心价值:
+    - 将内存复杂度从线性 O(T) 降低到对数级 O(log T)。
+    - 允许模拟极长流动时间 (l -> infinity)。
+    
+    Update: 
+    - 增加了类似 standard/ckpt 模式的实时进度打印 (Print) 和内存日志 (Memlog)。
+    """
+    # Fast memory profiling mode: run a SHORT real forward flow and ONE base-case buffer compute.
+    if _fastmem_enabled():
+        seg_len = _fastmem_steps()
+        T_total = len(dl_list)
+        fwd_steps = min(_fastmem_fwd_steps(), max(0, T_total - 1))
+        tol = _fastmem_ode_tol()
+        rtol = tol
+        atol = tol
+        dtype = np.float32
+        memlog("fast:before_storage", step=0, mode="recursive", T_total=T_total, fwd_steps=fwd_steps, bck_steps=seg_len, base_case_steps=seg_len)
+
+        # Short REAL forward flow (rolling state only)
+        H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+        curr_h2 = jnp.array(H2)
+        curr_hint = jnp.array(Hint)
+        for k in range(1, fwd_steps + 1):
+            curr_h2, curr_hint = _fastmem_ode_step(curr_h2, curr_hint, float(dl_list[k - 1]), float(dl_list[k]), rtol, atol, method=method)
+            if k == fwd_steps:
+                memlog("fast:after_transient_step", step=k, mode="recursive", T_total=T_total, fwd_steps=fwd_steps)
+
+        # Base-case dense trajectory buffer (H2/H4 snapshots for seg_len steps) + REAL fill
+        traj2 = np.zeros((seg_len + 1, n, n), dtype=dtype)
+        traj4 = np.zeros((seg_len + 1, n, n, n, n), dtype=dtype)
+        _fastmem_touch(traj2)
+        _fastmem_touch(traj4)
+        memlog("fast:after_bck_alloc", step=0, mode="recursive", bck_steps=seg_len)
+
+        temp_h2 = curr_h2
+        temp_hint = curr_hint
+        traj2[0] = np.array(temp_h2, dtype=dtype)
+        traj4[0] = np.array(temp_hint, dtype=dtype)
+        for i in range(1, seg_len + 1):
+            k0 = min(i, len(dl_list) - 1)
+            temp_h2, temp_hint = _fastmem_ode_step(temp_h2, temp_hint, float(dl_list[k0 - 1]), float(dl_list[k0]), rtol, atol, method=method)
+            traj2[i] = np.array(temp_h2, dtype=dtype)
+            traj4[i] = np.array(temp_hint, dtype=dtype)
+        memlog("fast:after_bck_compute", step=0, mode="recursive", bck_steps=seg_len)
+
+        # Final operators
+        H0_diag = np.zeros((n, n), dtype=dtype)
+        Hint2 = np.zeros((n, n, n, n), dtype=dtype)
+        liom2 = np.zeros((n, n), dtype=dtype)
+        liom4 = np.zeros((n, n, n, n), dtype=dtype)
+        memlog("fast:after_flow", step=0, mode="recursive", T_total=T_total)
+
+        return {
+            "H0_diag": H0_diag,
+            "Hint": Hint2,
+            "LIOM Interactions": np.zeros(max(n - 1, 0), dtype=dtype),
+            "LIOM2": liom2,
+            "LIOM4": liom4,
+            "LIOM2_FWD": liom2,
+            "LIOM4_FWD": liom4,
+            "Invariant": 0.0,
+            "dl_list": np.array(dl_list),
+            "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        }
+
+    # Uses module-level jnp/jit imports
+    
+    H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+    
+    # 预编译核心更新函数
+    jit_update = jit(update) 
+    
+    # 初始状态
+    H2_init = jnp.array(H2)
+    Hint_init = jnp.array(Hint)
+    
+    # 递归基准大小 (Base Case Block Size)
+    # Keep consistent across methods for fair memory comparisons.
+    BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
+    
+    print(f"        [Recursive Flow] Strategy: Pure Recursive Bisection (Memory: O(log T))")
+    print(f"        [Recursive Flow] Total steps: {len(dl_list)}, Base case threshold: {BASE_CASE_STEPS}")
+
+    # --- 辅助函数：前向积分 Hamiltonian ---
+    # 增加 log_progress 参数，仅在 Phase 1 开启日志，递归内部重算时不打印
+    def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False):
+        curr_h2, curr_hint = h2, hint
+        
+        # 进度条控制变量
+        total_steps = len(dl_list)
+        last_progress = 0
+        
+        k = t_start_idx
+        while k < t_end_idx:
+            # 使用高精度步长
+            steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
+            # 积分一步
+            soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+            curr_h2, curr_hint = soln[0][-1], soln[1][-1]
+            k += 1
+            
+            # --- 日志逻辑 (仅 Phase 1) ---
+            if log_progress:
+                # 1. Memlog (每 10 步)
+                if k % 10 == 0:
+                    memlog("flow:step", step=k, mode="recursive_fwd")
+                
+                # 2. Print Progress (每 10% 或 50 步)
+                progress = (k * 100) // total_steps
+                if (progress >= last_progress + 10) or (k % 50 == 0) or (k == total_steps):
+                    # 计算非对角元大小用于监控收敛
+                    off_diag = jnp.max(jnp.abs(curr_h2 - jnp.diag(jnp.diag(curr_h2))))
+                    print(f"        [Phase 1] Step {k}/{total_steps} ({progress}%) | l={dl_list[min(k, total_steps-1)]:.4f} | off-diag={off_diag:.2e}", flush=True)
+                    last_progress = progress
+
+        return curr_h2, curr_hint
+
+    # 1. 第一阶段：快速前向跑到底 (Phase 1: Forward Pass)
+    print("        [Recursive Flow] Phase 1: Forward pass to determine H(inf)...")
+    _t_start = time.perf_counter()
+    
+    # 开启日志 log_progress=True
+    H2_final, Hint_final = integrate_h_forward(H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True)
+    
+    print(f"        [Recursive Flow] Phase 1 done in {time.perf_counter()-_t_start:.2f}s")
+    
+    # 提取 l-bits
+    H0_diag = H2_final
+    Hint2 = Hint_final
+    HFint = jnp.zeros(n**2).reshape(n,n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i,j].set(Hint2[i,i,j,j] - Hint2[i,j,j,i])
+    lbits = jnp.zeros(n-1)
+    for q in range(1,n):
+        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.)))
+        
+    print("        [Recursive Flow] Phase 2: Recursive Backward integration for LIOMs...")
+    
+    # 初始化 LIOM
+    liom2 = jnp.zeros((n,n))
+    liom2 = liom2.at[n//2,n//2].set(1.0)
+    liom4 = jnp.zeros((n,n,n,n))
+    
+    stats = {'recomputes': 0, 'max_depth': 0}
+
+    # --- 核心递归函数 (Recursive Solver) ---
+    def recursive_solve(t_start_idx, t_end_idx, h2_start, hint_start, current_liom2, current_liom4, depth):
+        stats['max_depth'] = max(stats['max_depth'], depth)
+        
+        # === Base Case: 线性/密集区间 ===
+        if (t_end_idx - t_start_idx) <= BASE_CASE_STEPS:
+            # 日志：处理 Base Case
+            # 注意：这是逆向过程，t_start_idx 代表我们当前“回溯”到的时间点
+            if t_start_idx % 20 == 0: # 减少打印频率
+                print(f"        [Phase 2] Backtracking LIOM: steps {t_end_idx} -> {t_start_idx}", flush=True)
+            memlog("flow:step", step=t_start_idx, mode="recursive_bwd")
+
+            # 1. Forward: 生成当前块的密集轨迹
+            trajectory = []
+            curr_h2, curr_hint = h2_start, hint_start
+            trajectory.append((curr_h2, curr_hint))
+            
+            for k in range(t_start_idx, t_end_idx):
+                steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
+                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+                curr_h2, curr_hint = soln[0][-1], soln[1][-1]
+                trajectory.append((curr_h2, curr_hint))
+            
+            # 2. Backward: 利用密集轨迹逆向演化 LIOM
+            l2, l4 = current_liom2, current_liom4
+            block_len = t_end_idx - t_start_idx
+            
+            for i in range(block_len - 1, -1, -1):
+                global_step = t_start_idx + i
+                h2_now, hint_now = trajectory[i]
+                t_span_bck = np.linspace(dl_list[global_step+1], dl_list[global_step], num=2, endpoint=True)
+                l2, l4 = jit_update(l2, l4, h2_now, hint_now, t_span_bck)
+            
+            return l2, l4
+
+        # === Recursive Step: 二分 ===
+        else:
+            mid_idx = (t_start_idx + t_end_idx) // 2
+            
+            # 1. Forward Recompute (不打印日志)
+            stats['recomputes'] += (mid_idx - t_start_idx)
+            h2_mid, hint_mid = integrate_h_forward(h2_start, hint_start, t_start_idx, mid_idx, log_progress=False)
+            
+            # 2. Recurse Right (先处理后半段)
+            l2_mid, l4_mid = recursive_solve(mid_idx, t_end_idx, h2_mid, hint_mid, current_liom2, current_liom4, depth+1)
+
+            # === 【核心优化】 ===
+            # 右半段处理完后，h2_mid 和 hint_mid 在左半段（Recurse Left）中完全不需要！
+            # 显式删除它们，防止它们在处理左半段时一直占用内存。
+            del h2_mid, hint_mid
+            # ===================
+            
+            # 3. Recurse Left (再处理前半段)
+            l2_final, l4_final = recursive_solve(t_start_idx, mid_idx, h2_start, hint_start, l2_mid, l4_mid, depth+1)
+            
+            return l2_final, l4_final
+
+    # 启动递归
+    _t_start_bck = time.perf_counter()
+    liom2_final, liom4_final = recursive_solve(0, len(dl_list)-1, H2_init, Hint_init, liom2, liom4, 0)
+    print(f"        [Recursive Flow] Phase 2 done in {time.perf_counter()-_t_start_bck:.2f}s")
+    print(f"        [Recursive Flow] Stats: Max recursion depth: {stats['max_depth']}, Recomputed steps: {stats['recomputes']}")
+    
+    # 简单的 Invariant 计算
+    delta = jnp.max(Hint)
+    e1 = jnp.trace(jnp.dot(H2,H2))
+    Hflat = HFint.reshape(n**2)
+    inv = 2*jnp.sum(Hflat**2)
+    e2 = jnp.trace(jnp.dot(H0_diag,H0_diag))
+    inv2 = jnp.abs(e1 - e2 + ((2*delta)**2)*(n-1) - inv)/jnp.abs(e2+((2*delta)**2)*(n-1))
+
+    # 打包结果
+    output = {
+        "H0_diag": np.array(H0_diag),
+        "Hint": np.array(Hint2),
+        "LIOM Interactions": lbits,
+        "LIOM2": np.array(liom2_final),
+        "LIOM4": np.array(liom4_final),
+        "LIOM2_FWD": np.array(liom2_final), 
+        "LIOM4_FWD": np.array(liom4_final),
+        "Invariant": inv2,
+        "dl_list": np.array(dl_list),
+        "truncation_err": np.array([0.,0.,0.,0.])
+    }
+    
+    return output
+
+def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensordot', norm=False, Hflow=False, store_flow=False):
+    """
+    [模式 D - 连续内存版] 混合精度递归 (Hybrid: Recursive + Quantized + Contiguous Buffer)
+    
+    关键改进:
+    - Pre-allocation: 放弃 list.append，改为预分配连续的 (BlockSize, N, N) Numpy 数组。
+    - Zero Fragmentation: 彻底消除小对象造成的内存碎片。
+    - Forced Sync: 数据搬运时强制同步，防止 JAX 指令队列堆积。
+    """
+    # Fast memory profiling mode: run a SHORT real forward flow and ONE hybrid base-case buffer compute.
+    if _fastmem_enabled():
+        seg_len = _fastmem_steps()
+        T_total = len(dl_list)
+        fwd_steps = min(_fastmem_fwd_steps(), max(0, T_total - 1))
+        tol = _fastmem_ode_tol()
+        rtol = tol
+        atol = tol
+        memlog("fast:before_storage", step=0, mode="hybrid", T_total=T_total, fwd_steps=fwd_steps, bck_steps=seg_len, base_case_steps=seg_len)
+
+        # Short REAL forward flow (rolling state only, float32)
+        H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+        curr_h2 = jnp.array(H2)
+        curr_hint = jnp.array(Hint)
+        for k in range(1, fwd_steps + 1):
+            curr_h2, curr_hint = _fastmem_ode_step(curr_h2, curr_hint, float(dl_list[k - 1]), float(dl_list[k]), rtol, atol, method=method)
+            if k == fwd_steps:
+                memlog("fast:after_transient_step", step=k, mode="hybrid", T_total=T_total, fwd_steps=fwd_steps)
+
+        # contiguous buffers match the hybrid design: fp16
+        buffer_h2 = np.zeros((seg_len + 1, n, n), dtype=np.float16)
+        buffer_hint = np.zeros((seg_len + 1, n, n, n, n), dtype=np.float16)
+        _fastmem_touch(buffer_h2)
+        _fastmem_touch(buffer_hint)
+        memlog("fast:after_bck_alloc", step=0, mode="hybrid", bck_steps=seg_len)
+
+        # Fill the base-case buffer with REAL forward steps (seg_len)
+        temp_h2 = curr_h2
+        temp_hint = curr_hint
+        buffer_h2[0] = np.array(temp_h2, dtype=np.float16)
+        buffer_hint[0] = np.array(temp_hint, dtype=np.float16)
+        for i in range(1, seg_len + 1):
+            k0 = min(i, len(dl_list) - 1)
+            temp_h2, temp_hint = _fastmem_ode_step(temp_h2, temp_hint, float(dl_list[k0 - 1]), float(dl_list[k0]), rtol, atol, method=method)
+            buffer_h2[i] = np.array(temp_h2, dtype=np.float16)
+            buffer_hint[i] = np.array(temp_hint, dtype=np.float16)
+        memlog("fast:after_bck_compute", step=0, mode="hybrid", bck_steps=seg_len)
+
+        # Final operators (float32 storage by default)
+        dtype = np.float32
+        H0_diag = np.zeros((n, n), dtype=dtype)
+        Hint2 = np.zeros((n, n, n, n), dtype=dtype)
+        liom2 = np.zeros((n, n), dtype=dtype)
+        liom4 = np.zeros((n, n, n, n), dtype=dtype)
+        memlog("fast:after_flow", step=0, mode="hybrid", T_total=T_total)
+
+        return {
+            "H0_diag": H0_diag,
+            "Hint": Hint2,
+            "LIOM2": liom2,
+            "LIOM4": liom4,
+            "LIOM2_FWD": liom2,
+            "LIOM4_FWD": liom4,
+            "dl_list": np.array(dl_list),
+            "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        }
+
+    # Uses module-level jnp/jit/np imports
+    import gc
+    
+    H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+    jit_update = jit(update) 
+    
+    # Initial state dtype:
+    # - Do NOT force float64: respect JAX_ENABLE_X64 / PYFLOW_FLOAT32 config from main.
+    import jax
+    dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
+    H2_init = jnp.array(H2, dtype=dtype)
+    Hint_init = jnp.array(Hint, dtype=dtype)
+    
+    # Base Case Block Size (align with recursive for fair comparisons)
+    BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
+    
+    print(f"        [Hybrid Flow] Strategy: Recursive + FP16 + Contiguous Numpy Buffer")
+    print(f"        [Hybrid Flow] Steps: {len(dl_list)}, Base Block: {BASE_CASE_STEPS}")
+
+    # --- 前向积分 ---
+    def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False):
+        curr_h2, curr_hint = h2, hint
+        total_steps = len(dl_list)
+        last_progress = 0
+        k = t_start_idx
+        while k < t_end_idx:
+            steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
+            soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+            curr_h2, curr_hint = soln[0][-1], soln[1][-1]
+            k += 1
+            if log_progress:
+                if k % 10 == 0: memlog("flow:step", step=k, mode="hybrid_fwd")
+                progress = (k * 100) // total_steps
+                if (progress >= last_progress + 10) or (k % 50 == 0) or (k == total_steps):
+                    print(f"        [Hybrid Phase 1] Step {k}/{total_steps} ({progress}%)", flush=True)
+                    last_progress = progress
+        return curr_h2, curr_hint
+
+    # Phase 1: Forward
+    print("        [Hybrid Flow] Phase 1: Forward pass (float64)...")
+    H2_final, Hint_final = integrate_h_forward(H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True)
+    
+    # l-bits extraction
+    H0_diag = H2_final
+    Hint2 = Hint_final
+    HFint = jnp.zeros(n**2).reshape(n,n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i,j].set(Hint2[i,i,j,j] - Hint2[i,j,j,i])
+    lbits = jnp.zeros(n-1)
+    
+    print("        [Hybrid Flow] Phase 2: Backward integration (Contiguous Buffer)...")
+    liom2 = jnp.zeros((n,n)); liom2 = liom2.at[n//2,n//2].set(1.0)
+    liom4 = jnp.zeros((n,n,n,n))
+    
+    stats = {'recomputes': 0, 'max_depth': 0, 'quantized_blocks': 0}
+
+    # --- 递归求解器 ---
+    def recursive_solve(t_start_idx, t_end_idx, h2_start, hint_start, current_liom2, current_liom4, depth):
+        stats['max_depth'] = max(stats['max_depth'], depth)
+        
+        # === Base Case: 密集区间 ===
+        if (t_end_idx - t_start_idx) <= BASE_CASE_STEPS:
+            stats['quantized_blocks'] += 1
+            if t_start_idx % 50 == 0: memlog("flow:step", step=t_start_idx, mode="hybrid_bwd")
+
+            block_len = t_end_idx - t_start_idx
+            
+            # 【关键优化】预分配连续内存块 (Contiguous Memory Allocation)
+            # 形状：(Steps, N, N) 和 (Steps, N, N, N, N)
+            # 使用 float16 节省空间
+            # 这里的 +1 是为了存储起点
+            buffer_h2 = np.zeros((block_len + 1, n, n), dtype=np.float16)
+            buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=np.float16)
+
+            curr_h2, curr_hint = h2_start, hint_start
+            
+            # 1. Forward: 填充 buffer
+            # 必须先把 JAX 数组 block 住，确保计算完成
+            curr_h2.block_until_ready()
+            
+            # 存入起点 (JAX -> Numpy 自动发生)
+            buffer_h2[0] = np.array(curr_h2, dtype=np.float16)
+            buffer_hint[0] = np.array(curr_hint, dtype=np.float16)
+            
+            for k in range(t_start_idx, t_end_idx):
+                steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
+                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+                curr_h2, curr_hint = soln[0][-1], soln[1][-1]
+                
+                # 存入 buffer
+                local_idx = k - t_start_idx + 1
+                curr_h2.block_until_ready() # 强制同步
+                buffer_h2[local_idx] = np.array(curr_h2, dtype=np.float16)
+                buffer_hint[local_idx] = np.array(curr_hint, dtype=np.float16)
+            
+            # 2. Backward: 从 buffer 读取
+            l2, l4 = current_liom2, current_liom4
+            
+            for i in range(block_len - 1, -1, -1):
+                global_step = t_start_idx + i
+                local_idx = i # 对应 buffer 中的位置
+                
+                # Restore from Numpy buffer into JAX arrays (match configured dtype)
+                h2_now = jnp.array(buffer_h2[local_idx], dtype=dtype)
+                hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype)
+                
+                t_span_bck = np.linspace(dl_list[global_step+1], dl_list[global_step], num=2, endpoint=True)
+                l2, l4 = jit_update(l2, l4, h2_now, hint_now, t_span_bck)
+            
+            # 3. 显式释放大块内存
+            del buffer_h2, buffer_hint
+            gc.collect()
+            
+            return l2, l4
+
+        # === Recursive Step: 二分 ===
+        else:
+            mid_idx = (t_start_idx + t_end_idx) // 2
+            stats['recomputes'] += (mid_idx - t_start_idx)
+            
+            h2_mid, hint_mid = integrate_h_forward(h2_start, hint_start, t_start_idx, mid_idx, log_progress=False)
+            
+            l2_mid, l4_mid = recursive_solve(mid_idx, t_end_idx, h2_mid, hint_mid, current_liom2, current_liom4, depth+1)
+            
+            del h2_mid, hint_mid
+            gc.collect() 
+            
+            l2_final, l4_final = recursive_solve(t_start_idx, mid_idx, h2_start, hint_start, l2_mid, l4_mid, depth+1)
+            
+            return l2_final, l4_final
+
+    # 启动
+    liom2_final, liom4_final = recursive_solve(0, len(dl_list)-1, H2_init, Hint_init, liom2, liom4, 0)
+    
+    # 输出部分不变
+    output = {
+        "H0_diag": np.array(H0_diag), "Hint": np.array(Hint2),
+        "LIOM2": np.array(liom2_final), "LIOM4": np.array(liom4_final),
+        "LIOM2_FWD": np.array(liom2_final), "LIOM4_FWD": np.array(liom4_final),
+        "dl_list": np.array(dl_list),
+        "truncation_err": np.array([0.,0.,0.,0.])
+    }
+    return output
 

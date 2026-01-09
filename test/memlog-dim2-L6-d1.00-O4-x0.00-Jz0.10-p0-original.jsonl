@@ -1,0 +1,5 @@
+{"t_wall": 1767763193.0658891, "t_mono": 182241.92912141, "pid": 97199, "tag": "main:before_flow", "step": 0, "rss_bytes": 476823552, "rss_mb": 454.734375, "d": 1.0, "delta": 0.1, "L": 6, "n": 36, "dim": 2}
+{"t_wall": 1767769808.8881266, "t_mono": 188857.75136106, "pid": 97199, "tag": "main:after_flow", "step": 0, "rss_bytes": 6004695040, "rss_mb": 5726.5234375}
+{"t_wall": 1767769808.888789, "t_mono": 188857.752021505, "pid": 97199, "tag": "main:before_h5_write", "step": 0, "rss_bytes": 6000500736, "rss_mb": 5722.5234375}
+{"t_wall": 1767769815.540731, "t_mono": 188864.403965081, "pid": 97199, "tag": "main:after_h5_write", "step": 0, "rss_bytes": 2549932032, "rss_mb": 2431.8046875}
+{"t_wall": 1767769815.7376971, "t_mono": 188864.600930998, "pid": 97199, "tag": "main:after_gc", "step": 0, "rss_bytes": 2549932032, "rss_mb": 2431.8046875}

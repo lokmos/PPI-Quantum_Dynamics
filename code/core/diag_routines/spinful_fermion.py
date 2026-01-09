@@ -28,11 +28,28 @@ and numerically integrate the flow equation to obtain a diagonal Hamiltonian.
 """
 
 import os
-from psutil import cpu_count
+try:
+    from psutil import cpu_count  # type: ignore
+except Exception:
+    cpu_count = None  # type: ignore
 # Set up threading options for parallel solver
-os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False)))       # Set number of OpenMP threads to run in parallel
-os.environ['MKL_NUM_THREADS']= str(int(cpu_count(logical=False)))       # Set number of MKL threads to run in parallel
-os.environ['NUMBA_NUM_THREADS'] = str(int(cpu_count(logical=False)))    # Set number of Numba threads
+def _safe_num_cores() -> int:
+    try:
+        if cpu_count is not None:
+            n = cpu_count(logical=False)
+            if n is None:
+                n = cpu_count(logical=True)
+            if n:
+                return int(n)
+    except Exception:
+        pass
+    return int(os.cpu_count() or 1)
+
+_NCORES = str(_safe_num_cores())
+# Respect externally-provided thread settings (e.g. benchmark harness) to avoid oversubscription.
+os.environ.setdefault('OMP_NUM_THREADS', _NCORES)       # Set number of OpenMP threads to run in parallel
+os.environ.setdefault('MKL_NUM_THREADS', _NCORES)       # Set number of MKL threads to run in parallel
+os.environ.setdefault('NUMBA_NUM_THREADS', _NCORES)     # Set number of Numba threads
 import numpy as np
 from numba import jit
 import gc

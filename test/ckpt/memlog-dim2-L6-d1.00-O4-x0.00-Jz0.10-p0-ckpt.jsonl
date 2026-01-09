@@ -91,3 +91,13 @@
 {"t_wall": 1767919115.0699959, "t_mono": 338163.93322955, "pid": 190891, "tag": "flow:step", "step": 900, "rss_bytes": 6544044032, "rss_mb": 6240.88671875, "mode": "checkpoint"}
 {"t_wall": 1767919420.1206064, "t_mono": 338468.983840469, "pid": 190891, "tag": "flow:step", "step": 910, "rss_bytes": 6886854656, "rss_mb": 6567.81640625, "mode": "checkpoint"}
 {"t_wall": 1767919846.2853668, "t_mono": 338895.148600428, "pid": 190891, "tag": "flow:step", "step": 920, "rss_bytes": 6612865024, "rss_mb": 6306.51953125, "mode": "checkpoint"}
+{"t_wall": 1767920248.5041935, "t_mono": 339297.367427433, "pid": 190891, "tag": "flow:step", "step": 930, "rss_bytes": 6987415552, "rss_mb": 6663.71875, "mode": "checkpoint"}
+{"t_wall": 1767920812.7783647, "t_mono": 339861.641598494, "pid": 190891, "tag": "flow:step", "step": 940, "rss_bytes": 6659796992, "rss_mb": 6351.27734375, "mode": "checkpoint"}
+{"t_wall": 1767921403.6666799, "t_mono": 340452.529913812, "pid": 190891, "tag": "flow:step", "step": 950, "rss_bytes": 7009198080, "rss_mb": 6684.4921875, "mode": "checkpoint"}
+{"t_wall": 1767922081.3946517, "t_mono": 341130.257884961, "pid": 190891, "tag": "flow:step", "step": 960, "rss_bytes": 6665318400, "rss_mb": 6356.54296875, "mode": "checkpoint"}
+{"t_wall": 1767922773.8965724, "t_mono": 341822.759806267, "pid": 190891, "tag": "flow:step", "step": 970, "rss_bytes": 7054229504, "rss_mb": 6727.4375, "mode": "checkpoint"}
+{"t_wall": 1767923745.678002, "t_mono": 342794.541236022, "pid": 190891, "tag": "flow:step", "step": 980, "rss_bytes": 6696996864, "rss_mb": 6386.75390625, "mode": "checkpoint"}
+{"t_wall": 1767931249.754555, "t_mono": 350298.617788519, "pid": 190891, "tag": "main:after_flow", "step": 0, "rss_bytes": 7628173312, "rss_mb": 7274.79296875}
+{"t_wall": 1767931249.7550538, "t_mono": 350298.618285933, "pid": 190891, "tag": "main:before_h5_write", "step": 0, "rss_bytes": 7628173312, "rss_mb": 7274.79296875}
+{"t_wall": 1767931258.1830878, "t_mono": 350307.046322373, "pid": 190891, "tag": "main:after_h5_write", "step": 0, "rss_bytes": 7628697600, "rss_mb": 7275.29296875}
+{"t_wall": 1767931258.2834394, "t_mono": 350307.146672803, "pid": 190891, "tag": "main:after_gc", "step": 0, "rss_bytes": 7628697600, "rss_mb": 7275.29296875}

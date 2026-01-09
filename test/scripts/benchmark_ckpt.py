@@ -19,7 +19,6 @@ import json
 import subprocess
 import time
 import shutil
-import math
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,13 +61,13 @@ BASE_ENV = {
     "PYFLOW_TIMELOG": "1",
     "PYFLOW_SCRAMBLE": "0",
     "PYFLOW_OVERWRITE": "1",
-    "OMP_NUM_THREADS": _NUM_CORES,
-    "MKL_NUM_THREADS": _NUM_CORES,
-    "OPENBLAS_NUM_THREADS": _NUM_CORES,
-    "NUMBA_NUM_THREADS": _NUM_CORES,
-    "XLA_FLAGS": f"--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads={_NUM_CORES}",
-    # Optional: fast memory-profiling mode (skip expensive ODEs but keep allocations realistic).
-    # Enable by running benchmark_ckpt.py with env var PYFLOW_FASTMEM=1.
+    # Performance: avoid oversubscription.
+    # Let XLA own CPU parallelism; keep BLAS/OpenMP/Numba to 1 unless user overrides.
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMBA_NUM_THREADS": "1",
+    "XLA_FLAGS": f"--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads={_NUM_CORES} inter_op_parallelism_threads=1",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,160 +131,10 @@ def parse_memlog(filepath: Path) -> dict:
         "rss_net_mb": net_rss          # Net Increase (Algorithm Cost)
     }
 
-def _extract_tag_rows(memlog_path: Path) -> dict:
-    """Parse memlog JSONL and return a dict tag->row (last occurrence wins)."""
-    tags = {}
-    try:
-        lines = memlog_path.read_text().splitlines()
-    except Exception:
-        return tags
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        tag = obj.get("tag")
-        if tag:
-            tags[tag] = obj
-    return tags
-
-def append_predicted_peak(memlog_path: Path) -> None:
-    """
-    Append a JSONL record (tag=fast:predicted_peak) to the memlog itself.
-
-    Rules (as agreed):
-    - original/ckpt: extrapolate storage by (T_total / store_steps)
-    - ckpt/recursive/hybrid: add one bck segment/base-case buffer peak (measured via tags)
-    - recursive/hybrid: bck peak upper bound also includes binary recursion depth stack
-    - always include transient peak above (storage + bck buffer) from measured peak
-    """
-    if not memlog_path.exists():
-        return
-
-    # Avoid duplicates within the same file
-    try:
-        tail = memlog_path.read_text().splitlines()[-8:]
-        for line in tail:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("tag") == "fast:predicted_peak":
-                return
-    except Exception:
-        pass
-
-    tags = _extract_tag_rows(memlog_path)
-    main_before = tags.get("main:before_flow", {})
-    baseline = main_before.get("rss_mb")
-    L = main_before.get("L")
-    n = main_before.get("n")
-
-    stats = parse_memlog(memlog_path)
-    peak = stats.get("rss_peak_mb")
-
-    meta = tags.get("fast:before_storage", {})
-    mode = meta.get("mode") or main_before.get("mode")
-    T_total = meta.get("T_total")
-    store_steps = meta.get("store_steps")
-    ckpt_step = meta.get("ckpt_step")
-    bck_steps = meta.get("bck_steps")
-
-    def f(x, default=None):
-        try:
-            return float(x)
-        except Exception:
-            return default
-
-    def i(x, default=None):
-        try:
-            return int(x)
-        except Exception:
-            return default
-
-    baseline = f(baseline)
-    peak = f(peak)
-    L = i(L)
-    n = i(n)
-    T_total = i(T_total)
-    store_steps = i(store_steps)
-    ckpt_step = i(ckpt_step)
-    bck_steps = i(bck_steps)
-
-    rss_before_storage = f(tags.get("fast:before_storage", {}).get("rss_mb"), baseline)
-    rss_after_storage = f(tags.get("fast:after_storage_k", {}).get("rss_mb"), rss_before_storage)
-    rss_after_bck_alloc = f(tags.get("fast:after_bck_alloc", {}).get("rss_mb"), rss_after_storage)
-
-    storage_delta_k = None
-    if rss_before_storage is not None and rss_after_storage is not None:
-        storage_delta_k = max(0.0, rss_after_storage - rss_before_storage)
-
-    bck_delta = 0.0
-    if rss_after_bck_alloc is not None and rss_after_storage is not None:
-        bck_delta = max(0.0, rss_after_bck_alloc - rss_after_storage)
-
-    transient_delta = 0.0
-    if peak is not None:
-        ref = rss_after_storage or 0.0
-        if rss_after_bck_alloc is not None:
-            ref = max(ref, rss_after_bck_alloc)
-        transient_delta = max(0.0, peak - float(ref))
-
-    storage_full = 0.0
-    if mode in ("original", "ckpt") and storage_delta_k is not None and T_total and store_steps and store_steps > 0:
-        storage_full = float(storage_delta_k) * (float(T_total) / float(store_steps))
-
-    depth = None
-    stack_mb = 0.0
-    if mode in ("recursive", "hybrid") and T_total and bck_steps and bck_steps > 0 and n:
-        ratio = max(1.0, float(T_total) / float(bck_steps))
-        depth = int(math.ceil(math.log(ratio, 2.0)))
-        n2 = n * n
-        n4 = n2 * n2
-        state_bytes = (n2 + n4) * 4  # float32
-        stack_mb = (state_bytes / 1e6) * float(depth)
-
-    predicted_full_peak = None
-    if baseline is not None:
-        if mode == "original":
-            predicted_full_peak = baseline + storage_full + transient_delta
-        elif mode == "ckpt":
-            predicted_full_peak = baseline + storage_full + bck_delta + transient_delta
-        elif mode in ("recursive", "hybrid"):
-            predicted_full_peak = baseline + bck_delta + stack_mb + transient_delta
-
-    record = {
-        "tag": "fast:predicted_peak",
-        "L": L,
-        "n": n,
-        "mode": mode,
-        "T_total": T_total,
-        "store_steps": store_steps,
-        "ckpt_step": ckpt_step,
-        "bck_steps": bck_steps,
-        "rss_baseline_mb": baseline,
-        "rss_peak_mb_measured": peak,
-        "rss_peak_mb_full_est": predicted_full_peak,
-        "storage_delta_k_mb": storage_delta_k,
-        "storage_full_est_mb": storage_full,
-        "bck_delta_mb": bck_delta,
-        "transient_delta_mb": transient_delta,
-        "recursive_depth": depth,
-        "recursive_stack_est_mb": stack_mb,
-        "rule": "storage_extrapolate + bck_buffer + transient; recursive/hybrid add recursion_depth*state_size",
-    }
-
-    try:
-        with memlog_path.open("a") as fp:
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:
-        return
-
 def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float, p: int,
-                         verbose: bool, ode_tol: str, use_jit: bool, cutoff: str | None = None) -> dict:
+                         verbose: bool, ode_tol: str, use_jit: bool, cutoff: str | None = None,
+                         force_steps: str | None = None,
+                         run_base_dir: Path | None = None) -> dict:
     """Run benchmark for a specific mode."""
     
     if mode == "original":
@@ -299,17 +148,15 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    fastmem = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
-    mode_dir = (TEST_DIR / "fast" / mode) if fastmem else (TEST_DIR / mode)
+    base_dir = run_base_dir if run_base_dir is not None else TEST_DIR
+    mode_dir = (base_dir / mode)
     mode_dir.mkdir(parents=True, exist_ok=True)
 
     dim = 2; order = 4; x = 0.0; delta = 0.1
-    log_suffix = "-fastmem" if fastmem else ""
-    log_filename = f"memlog-dim{dim}-L{L}-d{d:.2f}-O{order}-x{x:.2f}-Jz{delta:.2f}-p{p}-{mode}{log_suffix}.jsonl"
+    log_filename = f"memlog-dim{dim}-L{L}-d{d:.2f}-O{order}-x{x:.2f}-Jz{delta:.2f}-p{p}-{mode}.jsonl"
     memlog_path = mode_dir / log_filename
     
-    if memlog_path.exists():
-        memlog_path.unlink()
+    # Do not delete/overwrite memlogs; run directory is unique per benchmark invocation.
 
     env = os.environ.copy()
     env.update(BASE_ENV)
@@ -319,6 +166,9 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
     env["PYFLOW_ODE_ATOL"] = ode_tol
     if cutoff is not None:
         env["PYFLOW_CUTOFF"] = str(cutoff)
+    if force_steps is not None:
+        env["PYFLOW_FORCE_STEPS"] = str(force_steps)
+    env["PYFLOW_MEMLOG_FILE"] = str(memlog_path)
 
     cmd = [
         sys.executable,
@@ -355,10 +205,6 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         # Display NET memory in the live progress
         print(f" [OK] Net: {stats['rss_net_mb']:.1f} MB (Abs: {stats['rss_peak_mb']:.0f}) ({elapsed:.1f}s)")
 
-        # Fastmem: write predicted full-flow peak back into the memlog itself
-        if fastmem:
-            append_predicted_peak(memlog_path)
-
         return {
             "L": L, "mode": mode, "status": "ok", 
             "elapsed_s": elapsed, "memlog": str(memlog_path), **stats
@@ -378,13 +224,11 @@ def collect_all_results(L_min, L_max, d, p):
     modes = ["original", "ckpt", "recursive", "hybrid"]
     data = {} 
     dim = 2; order = 4; x = 0.0; delta = 0.1
-    fastmem = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
-    base_dir = (TEST_DIR / "fast") if fastmem else TEST_DIR
+    base_dir = TEST_DIR
     for L in range(L_min, L_max + 1):
         data[L] = {}
         for mode in modes:
-            log_suffix = "-fastmem" if fastmem else ""
-            filename = f"memlog-dim{dim}-L{L}-d{d:.2f}-O{order}-x{x:.2f}-Jz{delta:.2f}-p{p}-{mode}{log_suffix}.jsonl"
+            filename = f"memlog-dim{dim}-L{L}-d{d:.2f}-O{order}-x{x:.2f}-Jz{delta:.2f}-p{p}-{mode}.jsonl"
             path = base_dir / mode / filename
             if path.exists():
                 stats = parse_memlog(path)
@@ -467,6 +311,7 @@ def main():
     use_jit = False
     ode_tol = DEFAULT_ODE_TOL
     cutoff = DEFAULT_CUTOFF
+    force_steps = None
     pos_args = []
     
     i = 0
@@ -491,6 +336,12 @@ def main():
             i += 1
             if i < len(args):
                 cutoff = args[i]
+        elif arg.startswith("--steps="):
+            force_steps = arg.split("=", 1)[1]
+        elif arg == "--steps":
+            i += 1
+            if i < len(args):
+                force_steps = args[i]
         else:
             pos_args.append(arg)
         i += 1
@@ -525,15 +376,21 @@ def main():
     mode_priority = {"original": 0, "ckpt": 1, "recursive": 2, "hybrid": 3}
     flat_tasks.sort(key=lambda x: (x[0], mode_priority.get(x[1], 99)))
 
-    # Fastmem: treat test/fast as a fresh run directory (clear once per benchmark job)
-    if os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True"):
-        fast_dir = TEST_DIR / "fast"
-        shutil.rmtree(fast_dir, ignore_errors=True)
-        fast_dir.mkdir(parents=True, exist_ok=True)
+    # (Fast memory-profiling mode removed)
+
+    # Create a unique output directory for this benchmark run to avoid overwriting results.
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_base_dir = TEST_DIR / "bench" / run_id
+    run_base_dir.mkdir(parents=True, exist_ok=True)
+
+    benchmark_start = time.time()
+    per_mode_elapsed_s: dict[str, float] = {"original": 0.0, "ckpt": 0.0, "recursive": 0.0, "hybrid": 0.0}
 
     print("=" * 110)
     print(f"BENCHMARK EXECUTION PLAN (L-First, Net Memory Reporting)")
-    print(f"ODE tol: {ode_tol} | cutoff: {cutoff if cutoff is not None else 'DEFAULT'} | JIT: {'ON' if use_jit else 'OFF'}")
+    steps_str = (f" | steps: {force_steps}" if force_steps is not None else "")
+    print(f"ODE tol: {ode_tol} | cutoff: {cutoff if cutoff is not None else 'DEFAULT'}{steps_str} | JIT: {'ON' if use_jit else 'OFF'}")
+    print(f"Output dir: {run_base_dir}")
     print("=" * 110)
     current_L = -1
     for L, mode in flat_tasks:
@@ -544,13 +401,39 @@ def main():
     print("\n" + "=" * 110)
     
     for L, mode in flat_tasks:
-        run_single_benchmark(L, mode, dis_type, method, d, p, verbose, ode_tol, use_jit, cutoff=cutoff)
+        r = run_single_benchmark(
+            L, mode, dis_type, method, d, p, verbose, ode_tol, use_jit,
+            cutoff=cutoff, force_steps=force_steps, run_base_dir=run_base_dir
+        )
+        if isinstance(r, dict) and r.get("status") == "ok":
+            try:
+                per_mode_elapsed_s[mode] = float(per_mode_elapsed_s.get(mode, 0.0)) + float(r.get("elapsed_s", 0.0))
+            except Exception:
+                pass
 
     print("\nGenerating Consolidated Report (Net Memory)...")
-    all_data = collect_all_results(L_min_global, L_max_global, d, p)
+    # Reuse the same report logic but point at this run directory
+    all_data = {}
+    dim = 2; order = 4; x = 0.0; delta = 0.1
+    modes = ["original", "ckpt", "recursive", "hybrid"]
+    for L in range(L_min_global, L_max_global + 1):
+        all_data[L] = {}
+        for mode in modes:
+            filename = f"memlog-dim{dim}-L{L}-d{d:.2f}-O{order}-x{x:.2f}-Jz{delta:.2f}-p{p}-{mode}.jsonl"
+            path = run_base_dir / mode / filename
+            if path.exists():
+                stats = parse_memlog(path)
+                if "error" not in stats:
+                    all_data[L][mode] = stats
+                    all_data[L][mode]["path"] = str(path)
     print_report(all_data, L_min_global, L_max_global)
 
-    # (fastmem summary is appended per-run)
+    total_wall = time.time() - benchmark_start
+    print("\nTiming Summary (wall time):")
+    print(f"  Total benchmark: {total_wall:.2f}s")
+    for m in ("original", "ckpt", "recursive", "hybrid"):
+        if per_mode_elapsed_s.get(m, 0.0) > 0:
+            print(f"  {m:<10}: {per_mode_elapsed_s[m]:.2f}s")
 
 if __name__ == "__main__":
     main()

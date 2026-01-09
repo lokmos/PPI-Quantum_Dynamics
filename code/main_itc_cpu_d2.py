@@ -52,10 +52,11 @@ def _get_num_cores() -> int:
         return int(os.cpu_count() or 1)
 
 _NUM_CORES = str(_get_num_cores())
-os.environ['OMP_NUM_THREADS'] = _NUM_CORES  # OpenMP threads
-os.environ['MKL_NUM_THREADS'] = _NUM_CORES  # MKL threads
-os.environ['KMP_DUPLICATE_LIB_OK'] = "TRUE"  # Necessary on some versions of OS X
-os.environ['KMP_WARNINGS'] = 'off'  # Silence non-critical warning
+# Respect externally-provided thread settings (e.g. benchmark harness) to avoid oversubscription.
+os.environ.setdefault('OMP_NUM_THREADS', _NUM_CORES)  # OpenMP threads
+os.environ.setdefault('MKL_NUM_THREADS', _NUM_CORES)  # MKL threads
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', "TRUE")  # Necessary on some versions of OS X
+os.environ.setdefault('KMP_WARNINGS', 'off')  # Silence non-critical warning
 
 import jax.numpy as jnp
 import numpy as np
@@ -71,10 +72,6 @@ try:
     from ED.ed import ED  # type: ignore
 except Exception:
     ED = None
-
-# Fast memory-profiling mode: we only care about allocations/peak RSS.
-# Skip ED/accuracy metrics that can fail with partial/approximate flows.
-FASTMEM = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
 
 #------------------------------------------------------------------------------  
 # Parameters
@@ -258,41 +255,38 @@ if __name__ == '__main__':
                         #-----------------------------------------------------------------
 
                         # Diagonalise with flow equations
-                        # If enabled, write memlog into repo-level test/ by default.
-                        # In fast memory-profiling mode (PYFLOW_FASTMEM=1), write into test/fast/<mode>/
-                        # to avoid overwriting baseline results.
+                        # If enabled, write memlog into repo-level test/<mode>/ to keep results organized.
                         if os.environ.get("PYFLOW_MEMLOG", "0") in ("1", "true", "True"):
-                            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                            
-                            # Determine mode string for directory and filename
-                            # Prioritize params (from env parsing above)
-                            if params["checkpoint_mode"] == "hybrid":
-                                mode_str = "hybrid"  # <--- 新增
-                            elif params["checkpoint_mode"] == "recursive":
-                                mode_str = "recursive"
-                            elif params["checkpoint_mode"] is True:
-                                mode_str = "ckpt"
+                            # If benchmark passes an explicit memlog file path, respect it.
+                            explicit = os.environ.get("PYFLOW_MEMLOG_FILE", "").strip()
+                            if explicit:
+                                os.makedirs(os.path.dirname(explicit), exist_ok=True)
+                                memlog_close()
+                                os.environ["PYFLOW_MEMLOG_FILE"] = explicit
                             else:
-                                mode_str = "original"
-                            
-                            fastmem = os.environ.get("PYFLOW_FASTMEM", "0") in ("1", "true", "True")
-
-                            # Create subdirectory:
-                            # - normal: test/<mode>/
-                            # - fastmem: test/fast/<mode>/
-                            if fastmem:
-                                test_dir = os.path.join(repo_root, "test", "fast", mode_str)
-                            else:
+                                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+                                
+                                # Determine mode string for directory and filename
+                                # Prioritize params (from env parsing above)
+                                if params["checkpoint_mode"] == "hybrid":
+                                    mode_str = "hybrid"
+                                elif params["checkpoint_mode"] == "recursive":
+                                    mode_str = "recursive"
+                                elif params["checkpoint_mode"] is True:
+                                    mode_str = "ckpt"
+                                else:
+                                    mode_str = "original"
+                                
                                 test_dir = os.path.join(repo_root, "test", mode_str)
-                            os.makedirs(test_dir, exist_ok=True)
-                            
-                            log_filename = (
-                                f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}"
-                                f"{'-fastmem' if fastmem else ''}.jsonl"
-                            )
-                            
-                            memlog_close()
-                            os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(test_dir, log_filename)
+                                os.makedirs(test_dir, exist_ok=True)
+                                
+                                log_filename = (
+                                    f"memlog-dim{dim}-L{L}-d{float(d):.2f}-O{order}-x{float(x):.2f}-Jz{float(delta):.2f}-p{p}-{mode_str}"
+                                    f".jsonl"
+                                )
+                                
+                                memlog_close()
+                                os.environ["PYFLOW_MEMLOG_FILE"] = os.path.join(test_dir, log_filename)
 
                         print("  [3/4] Running flow equations...", flush=True)
                         memlog("main:before_flow", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n), dim=int(dim))
@@ -308,7 +302,7 @@ if __name__ == '__main__':
                             ncut = 6
 
                         # Diagonalise with ED (optional; requires QuSpin)
-                        if (not FASTMEM) and ED is not None and n <= ncut:
+                        if ED is not None and n <= ncut:
                             print("  [3.5/4] Running exact diagonalization (QuSpin)...", end=" ", flush=True)
                             ed_startTime = datetime.now()
                             if dyn == True:
@@ -324,12 +318,10 @@ if __name__ == '__main__':
                             ed = np.zeros(n)
                             if ED is None:
                                 print("        (QuSpin not available, skipping ED)")
-                            elif FASTMEM:
-                                print("        (FASTMEM enabled, skipping ED/accuracy checks)")
                             else:
                                 print(f"        (System too large for ED: n={n} > {ncut})")
 
-                        if (not FASTMEM) and (intr == False or n <= ncut) and ED is not None:
+                        if (intr == False or n <= ncut) and ED is not None:
                             if species == 'spinless fermion':
                                 flevels = utility.flow_levels(n,flow,intr,order)
                             elif species == 'spinful fermion':
@@ -341,7 +333,7 @@ if __name__ == '__main__':
                             flevels=np.zeros(n)
                             ed=np.zeros(n)
 
-                        if (not FASTMEM) and (intr == False or n <= ncut) and ED is not None:
+                        if (intr == False or n <= ncut) and ED is not None:
                             lsr = utility.level_stat(flevels)
                             lsr2 = utility.level_stat(ed)
 
@@ -396,7 +388,7 @@ if __name__ == '__main__':
                                 hf.create_dataset('H2_up',data=ham.H2_spinup)
                                 hf.create_dataset('H2_dn',data=ham.H2_spindown)
 
-                            if (not FASTMEM) and ED is not None and n <= ncut:
+                            if ED is not None and n <= ncut:
                                 _h5_put(hf, 'ed_runtime', str(ed_endTime))
                                 _h5_put(hf, 'flevels', flevels, compression='gzip', compression_opts=9)
                                 _h5_put(hf, 'ed', ed, compression='gzip', compression_opts=9)
@@ -431,7 +423,7 @@ if __name__ == '__main__':
                                         # hf.create_dataset('nt_list',data = flow["nt_list"])
                                         hf.create_dataset('itc',data=flow["itc"])
                                         hf.create_dataset('itc_nonint',data=flow["itc_nonint"])
-                                        if (not FASTMEM) and ED is not None and n <= ncut:
+                                        if ED is not None and n <= ncut:
                                             hf.create_dataset('ed_itc',data=ed_itc)
                                     # hf.create_dataset('inv',data=flow["Invariant"])
                             if dyn == True:
@@ -440,7 +432,7 @@ if __name__ == '__main__':
                                     hf.create_dataset('imbalance',data=flow["Imbalance"])
                                 else:
                                     hf.create_dataset('flow_dyn', data = flow["Density Dynamics"])
-                                if (not FASTMEM) and n <= ncut:
+                                if n <= ncut:
                                     hf.create_dataset('ed_dyn', data = ed_dyn)
                         memlog("main:after_h5_write", step=p)
                         print(f"done ({(datetime.now()-save_start).total_seconds():.2f}s)")

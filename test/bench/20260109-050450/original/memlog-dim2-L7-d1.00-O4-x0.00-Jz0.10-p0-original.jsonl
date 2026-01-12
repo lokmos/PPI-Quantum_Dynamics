@@ -1,0 +1,7 @@
+{"t_wall": 1767939936.3312008, "t_mono": 358985.194434382, "pid": 244613, "tag": "main:start", "rss_bytes": 351686656, "rss_mb": 335.39453125}
+{"t_wall": 1767939936.798507, "t_mono": 358985.661739374, "pid": 244613, "tag": "main:before_flow", "step": 0, "rss_bytes": 496418816, "rss_mb": 473.421875, "d": 1.0, "delta": 0.1, "L": 7, "n": 49, "dim": 2}
+{"t_wall": 1767939938.4705265, "t_mono": 358987.333759517, "pid": 244613, "tag": "flow:alloc", "step": 0, "rss_bytes": 12118683648, "rss_mb": 11557.27734375, "mode": "original", "kind": "sol2/sol4_chunked", "steps": 1000, "n": 49, "chunk_size": 250}
+{"t_wall": 1767942685.0510607, "t_mono": 361733.914294651, "pid": 244613, "tag": "main:after_flow", "step": 0, "rss_bytes": 24635559936, "rss_mb": 23494.30078125}
+{"t_wall": 1767942685.0514555, "t_mono": 361733.914687636, "pid": 244613, "tag": "main:before_h5_write", "step": 0, "rss_bytes": 24635559936, "rss_mb": 23494.30078125}
+{"t_wall": 1767942686.0433507, "t_mono": 361734.906583826, "pid": 244613, "tag": "main:after_h5_write", "step": 0, "rss_bytes": 24636084224, "rss_mb": 23494.80078125}
+{"t_wall": 1767942686.1612296, "t_mono": 361735.024461847, "pid": 244613, "tag": "main:after_gc", "step": 0, "rss_bytes": 24636084224, "rss_mb": 23494.80078125}

@@ -1,0 +1,33 @@
+{
+  "2": {
+    "error": "All compared spectral entries are non-finite (nan/inf).",
+    "n_total": 6,
+    "n_finite": 0,
+    "n_nonfinite_flow_original": 6,
+    "n_nonfinite_flow_hybrid": 6,
+    "n_nonfinite_ed": 0,
+    "flow_source_original": "unknown",
+    "flow_source_hybrid": "flevels",
+    "preview_flow_original": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ],
+    "preview_flow_hybrid": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ],
+    "preview_ed": [
+      -1.035958820667433,
+      -0.9652923504728217,
+      -0.05000000000000049,
+      0.05000000000000049,
+      0.9652923504728204
+    ]
+  }
+}

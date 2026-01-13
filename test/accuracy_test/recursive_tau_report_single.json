@@ -1,0 +1,68 @@
+{
+  "args": {
+    "L": 3,
+    "steps": 650,
+    "cutoff": "1e-2",
+    "rtol": "1e-6",
+    "atol": "1e-6",
+    "dis_type": "--step=1000",
+    "method": "tensordot",
+    "d": 1.0,
+    "p": 0,
+    "tau_h4": false,
+    "w4": [
+      1.0
+    ],
+    "include_expensive": false,
+    "only": "delta_h2_h4",
+    "out": "test/accuracy_test/recursive_tau_report_single.json"
+  },
+  "results": [
+    {
+      "base_cases": 42,
+      "max_block_len": 20,
+      "max_depth": 6,
+      "recomputed_steps": 1715,
+      "split_strategy": "uniform",
+      "stack_checkpoints_max": 7,
+      "steps_total": 650,
+      "tau_dt_nonfinite": 0,
+      "tau_dt_nonzero": 0,
+      "tau_err_enabled": false,
+      "tau_include_hint": false,
+      "tau_mid_diff": 0,
+      "tau_mid_fallback": 0,
+      "tau_mode": "delta_h2",
+      "tau_w4": 1.0,
+      "tau_w_err": 1.0,
+      "tau_w_inv": 1.0,
+      "tau_w_off": 1.0,
+      "tau_w_rhs": 1.0,
+      "traj_snapshots_total": 692,
+      "case": "uniform"
+    },
+    {
+      "base_cases": 105,
+      "max_block_len": 19,
+      "max_depth": 86,
+      "recomputed_steps": 46191,
+      "split_strategy": "tau",
+      "stack_checkpoints_max": 87,
+      "steps_total": 650,
+      "tau_dt_nonfinite": 0,
+      "tau_dt_nonzero": 650,
+      "tau_err_enabled": false,
+      "tau_include_hint": true,
+      "tau_mid_diff": 104,
+      "tau_mid_fallback": 0,
+      "tau_mode": "delta_h2_h4",
+      "tau_w4": 1.0,
+      "tau_w_err": 1.0,
+      "tau_w_inv": 1.0,
+      "tau_w_off": 1.0,
+      "tau_w_rhs": 1.0,
+      "traj_snapshots_total": 755,
+      "case": "tau_delta_h2_h4_w4=1"
+    }
+  ]
+}

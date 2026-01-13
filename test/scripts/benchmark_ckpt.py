@@ -145,6 +145,9 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         use_ckpt_val = "recursive"
     elif mode == "hybrid":
         use_ckpt_val = "hybrid"
+    elif mode == "adaptive":
+        # adaptive grid runs on top of recursive checkpointing
+        use_ckpt_val = "recursive"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -168,6 +171,20 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         env["PYFLOW_CUTOFF"] = str(cutoff)
     if force_steps is not None:
         env["PYFLOW_FORCE_STEPS"] = str(force_steps)
+    if mode == "adaptive":
+        # Enable adaptive grid (step-doubling refinement) to reduce total steps at fixed error budget
+        env["PYFLOW_ADAPTIVE_GRID"] = "1"
+        env.setdefault("PYFLOW_ADAPTIVE_METHOD", "controller")
+        # Defaults tuned for benchmarking; override by exporting these env vars if needed
+        # target_dtau controls step count (larger => fewer steps)
+        env.setdefault("PYFLOW_ADAPTIVE_TARGET", "1e-2")
+        env.setdefault("PYFLOW_ADAPTIVE_INCLUDE_H4", "0")
+        env.setdefault("PYFLOW_ADAPTIVE_W4", "1.0")
+        env.setdefault("PYFLOW_ADAPTIVE_MIN_DL", "1e-8")
+        env.setdefault("PYFLOW_ADAPTIVE_MAX_DL", "1e2")
+        env.setdefault("PYFLOW_ADAPTIVE_MAX_STEPS", "20000")
+        # Progress prints for "grid building" so it never looks stuck
+        env.setdefault("PYFLOW_ADAPTIVE_LOG_EVERY", "200")
     env["PYFLOW_MEMLOG_FILE"] = str(memlog_path)
 
     cmd = [
@@ -221,7 +238,7 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         return {"L": L, "mode": mode, "status": "error", "error": str(e)}
 
 def collect_all_results(L_min, L_max, d, p):
-    modes = ["original", "ckpt", "recursive", "hybrid"]
+    modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
     data = {} 
     dim = 2; order = 4; x = 0.0; delta = 0.1
     base_dir = TEST_DIR
@@ -245,7 +262,7 @@ def print_report(data, L_min, L_max):
     print("=" * 110)
     
     # Headers
-    headers = f"{'L':<4} {'n':<4} │ {'Original':>10} {'Linear':>10} {'Recursive':>10} {'Hybrid':>10} │ {'Reduct(Rec)':>12} {'Reduct(Hyb)':>12}"
+    headers = f"{'L':<4} {'n':<4} │ {'Original':>10} {'Linear':>10} {'Recursive':>10} {'Hybrid':>10} {'Adaptive':>10} │ {'Reduct(Rec)':>12} {'Reduct(Hyb)':>12} {'Reduct(Adp)':>12}"
     print(headers)
     print("─" * 110)
 
@@ -264,11 +281,13 @@ def print_report(data, L_min, L_max):
         lin = get_val("ckpt")
         rec = get_val("recursive")
         hyb = get_val("hybrid")
+        adp = get_val("adaptive")
         
         s_orig = f"{orig:.0f}" if orig is not None else "-"
         s_lin = f"{lin:.0f}" if lin is not None else "-"
         s_rec = f"{rec:.0f}" if rec is not None else "-"
         s_hyb = f"{hyb:.0f}" if hyb is not None else "-"
+        s_adp = f"{adp:.0f}" if adp is not None else "-"
         
         # Calculate reductions relative to Original NET memory
         # Note: If Original Net is very small (e.g. < 1MB), reduction might be noisy
@@ -279,8 +298,9 @@ def print_report(data, L_min, L_max):
 
         r_rec = calc_reduct(rec)
         r_hyb = calc_reduct(hyb)
+        r_adp = calc_reduct(adp)
         
-        print(f"{L:<4} {n:<4} │ {s_orig:>10} {s_lin:>10} {s_rec:>10} {s_hyb:>10} │ {r_rec:>12} {r_hyb:>12}")
+        print(f"{L:<4} {n:<4} │ {s_orig:>10} {s_lin:>10} {s_rec:>10} {s_hyb:>10} {s_adp:>10} │ {r_rec:>12} {r_hyb:>12} {r_adp:>12}")
     print("─" * 110)
 
 def parse_plan(plan_str):
@@ -360,7 +380,7 @@ def main():
     else:
         L_min_arg = int(pos_args[0]) if len(pos_args) > 0 else 3
         L_max_arg = int(pos_args[1]) if len(pos_args) > 1 else 6
-        valid_modes = ["original", "ckpt", "recursive", "hybrid"]
+        valid_modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
         modes_to_run = valid_modes if mode_arg == "all" else [mode_arg]
         for m in modes_to_run:
             raw_tasks.append({"mode": m, "range": range(L_min_arg, L_max_arg + 1)})
@@ -373,7 +393,7 @@ def main():
         mode = t["mode"]
         for L in t["range"]:
             flat_tasks.append((L, mode))
-    mode_priority = {"original": 0, "ckpt": 1, "recursive": 2, "hybrid": 3}
+    mode_priority = {"original": 0, "ckpt": 1, "recursive": 2, "hybrid": 3, "adaptive": 4}
     flat_tasks.sort(key=lambda x: (x[0], mode_priority.get(x[1], 99)))
 
     # (Fast memory-profiling mode removed)
@@ -384,7 +404,7 @@ def main():
     run_base_dir.mkdir(parents=True, exist_ok=True)
 
     benchmark_start = time.time()
-    per_mode_elapsed_s: dict[str, float] = {"original": 0.0, "ckpt": 0.0, "recursive": 0.0, "hybrid": 0.0}
+    per_mode_elapsed_s: dict[str, float] = {"original": 0.0, "ckpt": 0.0, "recursive": 0.0, "hybrid": 0.0, "adaptive": 0.0}
 
     print("=" * 110)
     print(f"BENCHMARK EXECUTION PLAN (L-First, Net Memory Reporting)")
@@ -415,7 +435,7 @@ def main():
     # Reuse the same report logic but point at this run directory
     all_data = {}
     dim = 2; order = 4; x = 0.0; delta = 0.1
-    modes = ["original", "ckpt", "recursive", "hybrid"]
+    modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
     for L in range(L_min_global, L_max_global + 1):
         all_data[L] = {}
         for mode in modes:
@@ -431,7 +451,7 @@ def main():
     total_wall = time.time() - benchmark_start
     print("\nTiming Summary (wall time):")
     print(f"  Total benchmark: {total_wall:.2f}s")
-    for m in ("original", "ckpt", "recursive", "hybrid"):
+    for m in ("original", "ckpt", "recursive", "hybrid", "adaptive"):
         if per_mode_elapsed_s.get(m, 0.0) > 0:
             print(f"  {m:<10}: {per_mode_elapsed_s[m]:.2f}s")
 

@@ -199,8 +199,11 @@ def _approx_step_h2_h4(
     # Only enable approximations for the typical fast path
     if norm or (not Hflow):
         # Fallback to exact integrator call for this step
+        # Keep ODE tolerances consistent across modes (original / ckpt / recursive / hybrid)
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
         steps = np.linspace(l0, l1, num=2, endpoint=True)
-        soln = ode(int_ode, [H2, H4], steps, rtol=1e-6, atol=1e-8)
+        soln = ode(int_ode, [H2, H4], steps, rtol=_rtol, atol=_atol)
         return soln[0][-1], soln[1][-1]
 
     k_every = _approx_h4_update_every()
@@ -3729,7 +3732,10 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
     # 使用 jax.jit 编译核心步进函数以加速
     # 注意：这里为了简化展示逻辑，仍使用 ode 接口，实际循环中开销很小
     
-    print(f"        Forward integration (checkpointing): max_steps={len(dl_list)}, cutoff={cutoff:.2e}")
+    # Keep ODE tolerances consistent with standard flow_static_int
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+    print(f"        Forward integration (checkpointing): max_steps={len(dl_list)}, cutoff={cutoff:.2e}, rtol={_rtol:.0e}, atol={_atol:.0e}")
     last_progress = 0
     approx = _approx_enabled()
     _approx_cache: dict = {}
@@ -3751,7 +3757,7 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
                 Hflow=True,
             )
         else:
-            soln = ode(int_ode, [curr_H2, curr_Hint], steps, rtol=1e-5, atol=1e-6)
+            soln = ode(int_ode, [curr_H2, curr_Hint], steps, rtol=_rtol, atol=_atol)
             curr_H2 = soln[0][-1]
             curr_Hint = soln[1][-1]
         
@@ -3853,7 +3859,7 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
                 
                 # 往前走一步
                 t_span = np.linspace(dl_list_final[curr_step], dl_list_final[curr_step+1], num=2, endpoint=True)
-                soln = ode(int_ode, [temp_H2, temp_Hint], t_span, rtol=1e-5, atol=1e-6)
+                soln = ode(int_ode, [temp_H2, temp_Hint], t_span, rtol=_rtol, atol=_atol)
                 temp_H2 = soln[0][-1]
                 temp_Hint = soln[1][-1]
                 curr_step += 1
@@ -3942,20 +3948,375 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
     # 初始状态
     H2_init = jnp.array(H2)
     Hint_init = jnp.array(Hint)
+
+    # NOTE: adaptive-grid probing below uses the same `update()` step as the main forward pass
+    # (not odeint) to avoid mismatched evolution/metrics.
     
     # 记录原始dtype以避免在numpy转换时提升精度
     orig_dtype = H2_init.dtype
     
+    # Split strategy: uniform (index bisection) vs physics-informed (tau bisection)
+    split_strategy = os.environ.get("PYFLOW_RECURSIVE_SPLIT", "uniform").strip().lower()
+
+    # Tau metric mode (many options):
+    # - delta_h2 (default): ||ΔH2||_F
+    # - delta_h2_h4: ||ΔH2||_F + w4*||ΔH4||_F
+    # - rhs: ||dH2/dl||_F*dl + w4*||dH4/dl||_F*dl   (closest to ||[η,H]||)
+    # - offdiag: |Δ offdiag(H2)|  (off-diagonal Fro/max)
+    # - inv: |Δ inv| where inv ~= Tr(H2^2) + w4*||H4||_F^2  (drift proxy)
+    # - err: step-doubling error estimate (expensive)
+    # - combo: weighted sum of several components
+    tau_mode = os.environ.get("PYFLOW_TAU_MODE", "delta_h2").strip().lower()
+    tau_include_hint = os.environ.get("PYFLOW_TAU_INCLUDE_HINT", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        tau_w4 = float(os.environ.get("PYFLOW_TAU_W4", "1.0"))
+    except Exception:
+        tau_w4 = 1.0
+    try:
+        tau_w_off = float(os.environ.get("PYFLOW_TAU_W_OFF", "1.0"))
+    except Exception:
+        tau_w_off = 1.0
+    try:
+        tau_w_rhs = float(os.environ.get("PYFLOW_TAU_W_RHS", "1.0"))
+    except Exception:
+        tau_w_rhs = 1.0
+    try:
+        tau_w_inv = float(os.environ.get("PYFLOW_TAU_W_INV", "1.0"))
+    except Exception:
+        tau_w_inv = 1.0
+    try:
+        tau_w_err = float(os.environ.get("PYFLOW_TAU_W_ERR", "1.0"))
+    except Exception:
+        tau_w_err = 1.0
+    # Step-doubling configuration
+    tau_err_enabled = os.environ.get("PYFLOW_TAU_ERR_ENABLE", "0") in ("1", "true", "True", "on", "ON")
+
+    # NaN/Inf debugging (disabled by default)
+    _dbg_nan = os.environ.get("PYFLOW_DEBUG_NAN", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        _dbg_every = int(os.environ.get("PYFLOW_DEBUG_EVERY", "50"))
+    except Exception:
+        _dbg_every = 50
+    _dbg_include_hint = os.environ.get("PYFLOW_DEBUG_INCLUDE_HINT", "1") in ("1", "true", "True", "on", "ON")
+    _dbg_last_good = None  # type: ignore
+
+    # Keep ODE tolerances consistent with standard flow_static_int
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Adaptive grid (benchmark-friendly controller: reduces total steps T)
+    # ─────────────────────────────────────────────────────────────────────────
+    adaptive_grid = os.environ.get("PYFLOW_ADAPTIVE_GRID", "0") in ("1", "true", "True", "on", "ON")
+    adaptive_method = os.environ.get("PYFLOW_ADAPTIVE_METHOD", "controller").strip().lower()  # controller | (debug) step_doubling
+    # Target "arc-length" per step; smaller => more steps, larger => fewer steps.
+    try:
+        adapt_target = float(os.environ.get("PYFLOW_ADAPTIVE_TARGET", "1e-3"))
+    except Exception:
+        adapt_target = 1e-3
+    try:
+        adapt_min_dl = float(os.environ.get("PYFLOW_ADAPTIVE_MIN_DL", "1e-8"))
+    except Exception:
+        adapt_min_dl = 1e-8
+    try:
+        adapt_max_dl = float(os.environ.get("PYFLOW_ADAPTIVE_MAX_DL", "1e2"))
+    except Exception:
+        adapt_max_dl = 1e2
+    try:
+        adapt_max_steps = int(os.environ.get("PYFLOW_ADAPTIVE_MAX_STEPS", str(len(dl_list) * 5)))
+    except Exception:
+        adapt_max_steps = int(len(dl_list) * 5)
+    # Controller aggressiveness
+    try:
+        adapt_grow = float(os.environ.get("PYFLOW_ADAPTIVE_GROW", "2.0"))
+    except Exception:
+        adapt_grow = 2.0
+    try:
+        adapt_shrink = float(os.environ.get("PYFLOW_ADAPTIVE_SHRINK", "0.5"))
+    except Exception:
+        adapt_shrink = 0.5
+    try:
+        adapt_log_every = int(os.environ.get("PYFLOW_ADAPTIVE_LOG_EVERY", "0"))
+    except Exception:
+        adapt_log_every = 0
+    # If dtau is extremely small (or exactly 0 due to numerical underflow), do NOT shrink dl.
+    # Instead, grow dl to quickly traverse slow-evolution regions.
+    try:
+        adapt_min_dtau = float(os.environ.get("PYFLOW_ADAPTIVE_MIN_DTAU", "1e-14"))
+    except Exception:
+        adapt_min_dtau = 1e-14
+    # Use H4 in dtau for controller? Off by default because H4 may start near-zero and can destabilize
+    # relative-change metrics (huge dh4 / tiny ||H4||).
+    adapt_include_h4 = os.environ.get("PYFLOW_ADAPTIVE_INCLUDE_H4", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        adapt_w4 = float(os.environ.get("PYFLOW_ADAPTIVE_W4", "1.0"))
+    except Exception:
+        adapt_w4 = 1.0
+
+    def _step_ode(l0: float, l1: float, h2, h4):
+        """One integration step matching Phase-1 evolution (ode(int_ode, ...))."""
+        steps = np.linspace(float(l0), float(l1), num=2, endpoint=True)
+        # Ensure int_ode sees the same settings as the main flow.
+        def _rhs(y, l):
+            return int_ode(y, l, method=method, norm=norm, Hflow=True)
+        soln = ode(_rhs, [h2, h4], steps, rtol=_rtol, atol=_atol)
+        return soln[0][-1], soln[1][-1]
+
+    def _dtau_controller(prev_h2, prev_h4, next_h2, next_h4) -> float:
+        # Use a *relative* change metric so the controller isn't dominated by the absolute scale of H.
+        # This makes PYFLOW_ADAPTIVE_TARGET more portable across L / disorder realizations.
+        eps = 1e-12
+        dh2 = _fro_norm(next_h2 - prev_h2)
+        h2n = max(_fro_norm(prev_h2), _fro_norm(next_h2), eps)
+        val = dh2 / h2n
+        if adapt_include_h4:
+            dh4 = _fro_norm(next_h4 - prev_h4)
+            h4n = max(_fro_norm(prev_h4), _fro_norm(next_h4), eps)
+            val += adapt_w4 * (dh4 / h4n)
+        return float(val)
+
+    def _build_adaptive_dl_list(h2_init, h4_init, l_start: float, l_end: float, dl0: float):
+        """Online controller: one ODE solve per accepted step; adjust dl based on ||ΔH||."""
+        _t0 = time.perf_counter()
+        l = float(l_start)
+        dl = float(max(adapt_min_dl, min(adapt_max_dl, dl0)))
+        h2 = h2_init
+        h4 = h4_init
+        l_points = [l]
+        accepted = 0
+        retries = 0
+        hit_cap = False
+        dt_min = float("inf")
+        dt_max = 0.0
+        dl_min = float("inf")
+        dl_max = 0.0
+        last_dt = float("nan")
+        while (l < l_end) and (accepted < adapt_max_steps):
+            l1 = min(l_end, l + dl)
+            h2n, h4n = _step_ode(l, l1, h2, h4)
+            if (not _isfinite_all(h2n)) or (not _isfinite_all(h4n)):
+                # instability: shrink and retry
+                dl = max(adapt_min_dl, dl * adapt_shrink)
+                retries += 1
+                if dl <= adapt_min_dl:
+                    break
+                continue
+            dt = _dtau_controller(h2, h4, h2n, h4n)
+            last_dt = float(dt)
+            if np.isfinite(dt):
+                dt_min = min(dt_min, float(dt))
+                dt_max = max(dt_max, float(dt))
+            dl_min = min(dl_min, float(l1 - l))
+            dl_max = max(dl_max, float(l1 - l))
+            if (not np.isfinite(dt)):
+                # If dtau is unusable, keep dl conservative
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * adapt_shrink))
+            elif dt <= adapt_min_dtau:
+                # Evolution is too slow / underflowed: accelerate.
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * adapt_grow))
+            else:
+                # PI-like controller: scale dl to keep dt close to target, clamp growth
+                ratio = adapt_target / dt
+                ratio = max(adapt_shrink, min(adapt_grow, ratio))
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * ratio))
+            # accept
+            l = l1
+            h2, h4 = h2n, h4n
+            l_points.append(l)
+            accepted += 1
+            if adapt_log_every and ((accepted % adapt_log_every) == 0):
+                dt_str = f"{last_dt:.3e}" if np.isfinite(last_dt) else "nan"
+                print(
+                    f"        [Adaptive Grid] build: accepted={accepted}/{adapt_max_steps} "
+                    f"l={l:.4g}/{l_end:.4g} dl={float(l_points[-1]-l_points[-2]):.3e} dtau={dt_str} "
+                    f"retries={retries} elapsed={time.perf_counter()-_t0:.1f}s",
+                    flush=True,
+                )
+        if (l < l_end) and (accepted >= adapt_max_steps):
+            hit_cap = True
+        return np.array(l_points, dtype=float), {
+            "accepted": accepted,
+            "retries": retries,
+            "final_dl": dl,
+            "hit_cap": hit_cap,
+            "l_final": float(l),
+            "dt_min": float(dt_min if np.isfinite(dt_min) else float("nan")),
+            "dt_max": float(dt_max),
+            "dl_min": float(dl_min if np.isfinite(dl_min) else float("nan")),
+            "dl_max": float(dl_max),
+        }
+
+    def _isfinite_all(x) -> bool:
+        try:
+            return bool(jnp.all(jnp.isfinite(x)))
+        except Exception:
+            return False
+
+    def _dbg_snapshot(tag: str, k_step: int, l_val: float, h2, hint):
+        """Collect and maybe print a debug snapshot. Raises on first non-finite detection."""
+        nonlocal _dbg_last_good
+        if not _dbg_nan:
+            return
+        try:
+            h2_max = float(jnp.max(jnp.abs(h2)))
+        except Exception:
+            h2_max = float("nan")
+        hint_max = float("nan")
+        if _dbg_include_hint:
+            try:
+                hint_max = float(jnp.max(jnp.abs(hint)))
+            except Exception:
+                hint_max = float("nan")
+        h2_ok = _isfinite_all(h2)
+        hint_ok = _isfinite_all(hint) if _dbg_include_hint else True
+        snap = {
+            "tag": tag,
+            "step": int(k_step),
+            "l": float(l_val),
+            "max_abs_h2": h2_max,
+            "max_abs_h4": hint_max,
+            "finite_h2": bool(h2_ok),
+            "finite_h4": bool(hint_ok),
+        }
+
+        # Periodic print
+        if (k_step % _dbg_every) == 0:
+            print(f"        [DBG] step={snap['step']} l={snap['l']:.4g} max|H2|={snap['max_abs_h2']:.3e} "
+                  f"max|H4|={snap['max_abs_h4']:.3e} finite(H2,H4)=({snap['finite_h2']},{snap['finite_h4']})",
+                  flush=True)
+
+        # Detect first non-finite
+        if (not h2_ok) or (not hint_ok) or (not np.isfinite(h2_max)) or (_dbg_include_hint and (not np.isfinite(hint_max))):
+            print("        [DBG] ===== FIRST NON-FINITE DETECTED =====", flush=True)
+            if _dbg_last_good is not None:
+                print(f"        [DBG] last_good: {_dbg_last_good}", flush=True)
+            print(f"        [DBG] current  : {snap}", flush=True)
+            raise FloatingPointError("Non-finite values encountered in recursive forward integration")
+
+        _dbg_last_good = snap
+
+    def _fro_norm(x):
+        # Frobenius norm for JAX arrays, returns Python float
+        return float(jnp.sqrt(jnp.sum(jnp.abs(x) ** 2)))
+
+    def _offdiag_metric(h2) -> float:
+        # Off-diagonal magnitude proxy
+        try:
+            off = h2 - jnp.diag(jnp.diag(h2))
+            # Use max abs (cheap, matches existing logging semantics)
+            return float(jnp.max(jnp.abs(off)))
+        except Exception:
+            return float("nan")
+
+    def _inv_proxy(h2, hint) -> float:
+        # Cheap invariant/drift proxy (not the same as the full "Invariant" but catches runaway).
+        try:
+            e2 = float(jnp.trace(jnp.dot(h2, h2)))
+        except Exception:
+            e2 = float("nan")
+        if tau_include_hint:
+            try:
+                # ||H4||_F^2
+                h4n2 = float(jnp.sum(jnp.abs(hint) ** 2))
+            except Exception:
+                h4n2 = float("nan")
+            return e2 + tau_w4 * h4n2
+        return e2
+
+    def _rhs_norm(l0: float, h2, hint, dl: float) -> float:
+        # Closest to tau(l)=∫||[η,H]|| dl. Here we approximate with ||dH/dl|| * dl.
+        try:
+            dH2, dH4 = int_ode([h2, hint], l0, method=method, norm=norm, Hflow=True)
+            val = _fro_norm(dH2) * abs(dl)
+            if tau_include_hint:
+                val += tau_w4 * _fro_norm(dH4) * abs(dl)
+            return float(val)
+        except Exception:
+            return float("nan")
+
+    def _step_doubling_err(l0: float, l1: float, h2, hint) -> float:
+        # Expensive local error estimate (one step vs two half steps).
+        # Only for diagnosis/comparison; enable via PYFLOW_TAU_ERR_ENABLE=1.
+        if not tau_err_enabled:
+            return 0.0
+        try:
+            mid = 0.5 * (l0 + l1)
+            # One full step
+            sol_full = ode(int_ode, [h2, hint], np.linspace(l0, l1, num=2, endpoint=True), rtol=_rtol, atol=_atol)
+            h2_full, h4_full = sol_full[0][-1], sol_full[1][-1]
+            # Two half steps
+            sol_half1 = ode(int_ode, [h2, hint], np.linspace(l0, mid, num=2, endpoint=True), rtol=_rtol, atol=_atol)
+            h2_mid, h4_mid = sol_half1[0][-1], sol_half1[1][-1]
+            sol_half2 = ode(int_ode, [h2_mid, h4_mid], np.linspace(mid, l1, num=2, endpoint=True), rtol=_rtol, atol=_atol)
+            h2_two, h4_two = sol_half2[0][-1], sol_half2[1][-1]
+            err = _fro_norm(h2_two - h2_full)
+            if tau_include_hint:
+                err += tau_w4 * _fro_norm(h4_two - h4_full)
+            return float(err)
+        except Exception:
+            return float("nan")
+
+    def _dtau(prev_h2, prev_hint, next_h2, next_hint, l0: float, l1: float) -> float:
+        # Compute increment for selected tau mode.
+        dl = float(l1 - l0)
+        if tau_mode in ("delta_h2", "dh2"):
+            return _fro_norm(next_h2 - prev_h2)
+        if tau_mode in ("delta_h2_h4", "dh2dh4"):
+            val = _fro_norm(next_h2 - prev_h2)
+            return val + (tau_w4 * _fro_norm(next_hint - prev_hint))
+        if tau_mode in ("rhs", "flow", "speed"):
+            return tau_w_rhs * _rhs_norm(l0, prev_h2, prev_hint, dl)
+        if tau_mode in ("offdiag", "off", "offdiag_max"):
+            return tau_w_off * abs(_offdiag_metric(next_h2) - _offdiag_metric(prev_h2))
+        if tau_mode in ("inv", "invariant", "drift"):
+            return tau_w_inv * abs(_inv_proxy(next_h2, next_hint) - _inv_proxy(prev_h2, prev_hint))
+        if tau_mode in ("err", "error", "step_doubling"):
+            return tau_w_err * _step_doubling_err(l0, l1, prev_h2, prev_hint)
+        if tau_mode in ("combo", "mix"):
+            val = 0.0
+            # Always include ΔH2 as baseline
+            val += _fro_norm(next_h2 - prev_h2)
+            if tau_include_hint:
+                val += tau_w4 * _fro_norm(next_hint - prev_hint)
+            val += tau_w_off * abs(_offdiag_metric(next_h2) - _offdiag_metric(prev_h2))
+            val += tau_w_inv * abs(_inv_proxy(next_h2, next_hint) - _inv_proxy(prev_h2, prev_hint))
+            val += tau_w_rhs * _rhs_norm(l0, prev_h2, prev_hint, dl)
+            if tau_err_enabled:
+                val += tau_w_err * _step_doubling_err(l0, l1, prev_h2, prev_hint)
+            return float(val)
+        # Default fallback
+        return _fro_norm(next_h2 - prev_h2)
+
     # 递归基准大小 (Base Case Block Size)
     # Keep consistent across methods for fair memory comparisons.
     BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
     
-    print(f"        [Recursive Flow] Strategy: Pure Recursive Bisection (Memory: O(log T))")
+    if split_strategy in ("tau", "arc", "arclength", "physics", "physics_informed"):
+        strat = "Tau/Arc-Length Bisection (Physics-Informed)"
+    else:
+        strat = "Pure Index Bisection"
+    print(f"        [Recursive Flow] Strategy: {strat} (Memory: O(log T))")
     print(f"        [Recursive Flow] Total steps: {len(dl_list)}, Base case threshold: {BASE_CASE_STEPS}")
+    if split_strategy in ("tau", "arc", "arclength", "physics", "physics_informed"):
+        # Render tau mode
+        extra = tau_mode
+        if tau_mode in ("delta_h2_h4", "combo") and tau_include_hint:
+            extra += f"(w4={tau_w4:g})"
+        if tau_mode in ("rhs", "combo") and tau_w_rhs != 1.0:
+            extra += f"(w_rhs={tau_w_rhs:g})"
+        if tau_mode in ("offdiag", "combo") and tau_w_off != 1.0:
+            extra += f"(w_off={tau_w_off:g})"
+        if tau_mode in ("inv", "combo") and tau_w_inv != 1.0:
+            extra += f"(w_inv={tau_w_inv:g})"
+        if tau_mode in ("err", "combo") and tau_err_enabled:
+            extra += f"(w_err={tau_w_err:g})"
+        print(f"        [Recursive Flow] Split metric: tau mode={extra} include_H4={bool(tau_include_hint)} err_enable={bool(tau_err_enabled)}")
 
     # --- 辅助函数：前向积分 Hamiltonian ---
     # 增加 log_progress 参数，仅在 Phase 1 开启日志，递归内部重算时不打印
-    def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False):
+    # NOTE: Phase 1 runs before `stats` is defined; keep tau diagnostics separate here.
+    tau_diag = {"tau_dt_nonzero": 0, "tau_dt_nonfinite": 0}
+    def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False, tau_out=None):
         curr_h2, curr_hint = h2, hint
         
         # 进度条控制变量
@@ -3963,19 +4324,24 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
         last_progress = 0
         
         k = t_start_idx
-        approx = _approx_enabled()
+        # Adaptive grid: we run Phase 1 on an already-built dl_list (controller), so approx can remain.
+        # But for correctness benchmarking we keep approx disabled when adaptive_grid is on.
+        approx = _approx_enabled() and (not adaptive_grid)
         _approx_cache: dict = {}
         off_diag = float("inf")
         while k < t_end_idx:
+            prev_h2, prev_hint = curr_h2, curr_hint
             # 使用高精度步长
-            steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
+            l0 = float(dl_list[k])
+            l1 = float(dl_list[k + 1])
+            steps = np.linspace(l0, l1, num=2, endpoint=True)
             # 积分一步
             if approx and (not norm):
                 curr_h2, curr_hint = _approx_step_h2_h4(
                     curr_h2,
                     curr_hint,
-                    float(dl_list[k]),
-                    float(dl_list[k + 1]),
+                    l0,
+                    l1,
                     step_idx=k,
                     method=method,
                     cache=_approx_cache,
@@ -3983,9 +4349,28 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
                     Hflow=True,
                 )
             else:
-                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
                 curr_h2, curr_hint = soln[0][-1], soln[1][-1]
             k += 1
+            # Debug: detect NaN/Inf ASAP
+            try:
+                l_now = float(dl_list[min(k, len(dl_list) - 1)])
+            except Exception:
+                l_now = float("nan")
+            _dbg_snapshot("recursive_fwd", k, l_now, curr_h2, curr_hint)
+            if tau_out is not None:
+                try:
+                    dt = _dtau(prev_h2, prev_hint, curr_h2, curr_hint, l0, l1)
+                    if not np.isfinite(dt):
+                        # Keep tau monotone and usable; degrade by adding 0.
+                        tau_diag["tau_dt_nonfinite"] += 1
+                        dt = 0.0
+                    elif dt != 0.0:
+                        tau_diag["tau_dt_nonzero"] += 1
+                    tau_out.append(tau_out[-1] + float(dt))
+                except Exception:
+                    # Always keep array length consistent
+                    tau_out.append(tau_out[-1])
             # Phase 1 only: allow early stop based on cutoff
             if log_progress and (forced is None):
                 off_diag = float(jnp.max(jnp.abs(curr_h2 - jnp.diag(jnp.diag(curr_h2)))))
@@ -4008,16 +4393,56 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
                     print(f"        [Phase 1] Step {k}/{total_steps} ({progress}%) | l={dl_list[min(k, total_steps-1)]:.4f} | off-diag={off_diag:.2e}", flush=True)
                     last_progress = progress
 
-        return curr_h2, curr_hint
+        return curr_h2, curr_hint, k
 
     # 1. 第一阶段：快速前向跑到底 (Phase 1: Forward Pass)
     print("        [Recursive Flow] Phase 1: Forward pass to determine H(inf)...")
     _t_start = time.perf_counter()
     
+    # Optional: build adaptive dl_list (reduces total steps)
+    _adapt_allow_force = os.environ.get("PYFLOW_ADAPTIVE_ALLOW_FORCE", "0") in ("1", "true", "True", "on", "ON")
+    if adaptive_grid and adaptive_method == "controller" and ((forced is None) or _adapt_allow_force):
+        l_start = float(dl_list[0])
+        l_end = float(dl_list[-1])
+        # Start from mean step; logflow can have extremely tiny initial dl which would explode step counts.
+        dl0 = float((l_end - l_start) / max(1, (len(dl_list) - 1)))
+        print(
+            f"        [Adaptive Grid] Enabled (controller): target_dtau={adapt_target:.1e} "
+            f"min_dl={adapt_min_dl:.1e} max_dl={adapt_max_dl:.1e} max_steps={adapt_max_steps} "
+            f"include_H4={bool(adapt_include_h4)} w4={adapt_w4:g}",
+            flush=True,
+        )
+        dl_list_new, adp_stats = _build_adaptive_dl_list(H2_init, Hint_init, l_start, l_end, dl0)
+        if adp_stats.get("hit_cap", False):
+            print(
+                f"        [Adaptive Grid] WARNING: hit max_steps={adapt_max_steps} before reaching lmax "
+                f"(reached l={adp_stats.get('l_final', float('nan')):.4g}); "
+                f"dtau[min,max]=({adp_stats.get('dt_min', float('nan')):.3e},{adp_stats.get('dt_max', float('nan')):.3e}) "
+                f"dl[min,max]=({adp_stats.get('dl_min', float('nan')):.3e},{adp_stats.get('dl_max', float('nan')):.3e}); "
+                f"falling back to original grid (steps={len(dl_list)-1}). Consider increasing "
+                f"PYFLOW_ADAPTIVE_TARGET or PYFLOW_ADAPTIVE_MAX_STEPS.",
+                flush=True,
+            )
+        else:
+            print(f"        [Adaptive Grid] Steps: {len(dl_list_new)-1} (was {len(dl_list)-1}) retries={adp_stats['retries']}", flush=True)
+            dl_list = dl_list_new
+
     # 开启日志 log_progress=True
-    H2_final, Hint_final = integrate_h_forward(H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True)
+    tau_cum = None
+    if split_strategy in ("tau", "arc", "arclength", "physics", "physics_informed"):
+        tau_cum = [0.0]
+    H2_final, Hint_final, k_stop = integrate_h_forward(
+        H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True, tau_out=tau_cum
+    )
+    # If we stopped early (cutoff reached), truncate dl_list (and tau) so recursion doesn't waste work later.
+    if (forced is None) and (k_stop < (len(dl_list) - 1)):
+        dl_list = dl_list[: k_stop + 1]
+        if tau_cum is not None:
+            tau_cum = tau_cum[: k_stop + 1]
     
     print(f"        [Recursive Flow] Phase 1 done in {time.perf_counter()-_t_start:.2f}s")
+    if tau_cum is not None and len(tau_cum) >= 2:
+        print(f"        [Recursive Flow] Tau span: {tau_cum[-1]:.3e} over {len(tau_cum)-1} steps")
     
     # 提取 l-bits
     H0_diag = H2_final
@@ -4037,7 +4462,21 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
     liom2 = liom2.at[n//2,n//2].set(1.0)
     liom4 = jnp.zeros((n,n,n,n))
     
-    stats = {'recomputes': 0, 'max_depth': 0}
+    stats = {
+        'recomputes': 0,
+        'max_depth': 0,
+        # How many base-case blocks were executed (each materializes a dense trajectory locally)
+        'base_cases': 0,
+        # Total number of per-step snapshots materialized across all base-cases (sum(block_len+1))
+        'traj_snapshots_total': 0,
+        # Max block length encountered (in steps)
+        'max_block_len': 0,
+        # Tau diagnostics
+        'tau_dt_nonzero': 0,
+        'tau_dt_nonfinite': 0,
+        'tau_mid_fallback': 0,
+        'tau_mid_diff': 0,
+    }
 
     # --- 核心递归函数 (Recursive Solver) ---
     def recursive_solve(t_start_idx, t_end_idx, h2_start, hint_start, current_liom2, current_liom4, depth):
@@ -4045,6 +4484,8 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
         
         # === Base Case: 线性/密集区间 ===
         if (t_end_idx - t_start_idx) <= BASE_CASE_STEPS:
+            stats['base_cases'] += 1
+            stats['max_block_len'] = max(int(stats['max_block_len']), int(t_end_idx - t_start_idx))
             # 日志：处理 Base Case
             # 注意：这是逆向过程，t_start_idx 代表我们当前“回溯”到的时间点
             if t_start_idx % 20 == 0: # 减少打印频率
@@ -4066,6 +4507,7 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
                 traj2_np = np.array(traj2, dtype=orig_dtype)
                 traj4_np = np.array(traj4, dtype=orig_dtype)
                 del traj2, traj4  # 释放JAX数组
+                stats['traj_snapshots_total'] += int(traj2_np.shape[0])
             else:
                 trajectory = []
                 trajectory.append((curr_h2, curr_hint))
@@ -4074,6 +4516,7 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
                     soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
                     curr_h2, curr_hint = soln[0][-1], soln[1][-1]
                     trajectory.append((curr_h2, curr_hint))
+                stats['traj_snapshots_total'] += int(len(trajectory))
             
             # 2. Backward: 利用密集轨迹逆向演化 LIOM
             l2, l4 = current_liom2, current_liom4
@@ -4099,11 +4542,36 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
 
         # === Recursive Step: 二分 ===
         else:
-            mid_idx = (t_start_idx + t_end_idx) // 2
+            # Pick split point.
+            # Default: uniform index bisection.
+            # Tau mode: choose mid so that tau is split evenly between [start,end].
+            uniform_mid = (t_start_idx + t_end_idx) // 2
+            mid_idx = uniform_mid
+            if tau_cum is not None:
+                try:
+                    tau_s = float(tau_cum[t_start_idx])
+                    tau_e = float(tau_cum[t_end_idx])
+                    if tau_e > tau_s:
+                        tau_target = 0.5 * (tau_s + tau_e)
+                        # searchsorted assumes non-decreasing tau
+                        mid_idx = int(np.searchsorted(np.array(tau_cum), tau_target, side="left"))
+                        if mid_idx != uniform_mid:
+                            stats['tau_mid_diff'] += 1
+                    else:
+                        stats['tau_mid_fallback'] += 1
+                except Exception:
+                    stats['tau_mid_fallback'] += 1
+                    mid_idx = uniform_mid
+
+            # Guard against degenerate splits
+            if mid_idx <= t_start_idx:
+                mid_idx = t_start_idx + 1
+            if mid_idx >= t_end_idx:
+                mid_idx = t_end_idx - 1
             
             # 1. Forward Recompute (不打印日志)
             stats['recomputes'] += (mid_idx - t_start_idx)
-            h2_mid, hint_mid = integrate_h_forward(h2_start, hint_start, t_start_idx, mid_idx, log_progress=False)
+            h2_mid, hint_mid, _ = integrate_h_forward(h2_start, hint_start, t_start_idx, mid_idx, log_progress=False, tau_out=None)
             
             # 2. Recurse Right (先处理后半段)
             l2_mid, l4_mid = recursive_solve(mid_idx, t_end_idx, h2_mid, hint_mid, current_liom2, current_liom4, depth+1)
@@ -4124,6 +4592,34 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
     liom2_final, liom4_final = recursive_solve(0, len(dl_list)-1, H2_init, Hint_init, liom2, liom4, 0)
     print(f"        [Recursive Flow] Phase 2 done in {time.perf_counter()-_t_start_bck:.2f}s")
     print(f"        [Recursive Flow] Stats: Max recursion depth: {stats['max_depth']}, Recomputed steps: {stats['recomputes']}")
+    # Optional machine-readable stats line for benchmarking / comparisons
+    if os.environ.get("PYFLOW_RECURSIVE_STATS", "0") in ("1", "true", "True", "on", "ON"):
+        import json as _json  # local import
+        payload = {
+            "split_strategy": split_strategy,
+            "tau_mode": tau_mode,
+            "tau_include_hint": bool(tau_include_hint),
+            "tau_w4": float(tau_w4),
+            "tau_w_off": float(tau_w_off),
+            "tau_w_rhs": float(tau_w_rhs),
+            "tau_w_inv": float(tau_w_inv),
+            "tau_err_enabled": bool(tau_err_enabled),
+            "tau_w_err": float(tau_w_err),
+            "steps_total": int(len(dl_list) - 1),
+            "max_depth": int(stats["max_depth"]),
+            "recomputed_steps": int(stats["recomputes"]),
+            "base_cases": int(stats["base_cases"]),
+            "traj_snapshots_total": int(stats["traj_snapshots_total"]),
+            "max_block_len": int(stats["max_block_len"]),
+            # Phase-1 tau diagnostics
+            "tau_dt_nonzero": int(tau_diag.get("tau_dt_nonzero", 0)),
+            "tau_dt_nonfinite": int(tau_diag.get("tau_dt_nonfinite", 0)),
+            "tau_mid_fallback": int(stats.get("tau_mid_fallback", 0)),
+            "tau_mid_diff": int(stats.get("tau_mid_diff", 0)),
+            # log-memory "checkpoints on stack" proxy
+            "stack_checkpoints_max": int(stats["max_depth"]) + 1,
+        }
+        print(f"[RECURSIVE_STATS] {_json.dumps(payload, sort_keys=True)}", flush=True)
     
     # 简单的 Invariant 计算
     delta = jnp.max(Hint)
@@ -4177,6 +4673,10 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     
     # Base Case Block Size (align with recursive for fair comparisons)
     BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
+
+    # Keep ODE tolerances consistent with standard flow_static_int
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
     
     print(f"        [Hybrid Flow] Strategy: Recursive + FP16 + Contiguous Numpy Buffer")
     print(f"        [Hybrid Flow] Steps: {len(dl_list)}, Base Block: {BASE_CASE_STEPS}")
@@ -4252,10 +4752,35 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             
             # 【关键优化】预分配连续内存块 (Contiguous Memory Allocation)
             # 形状：(Steps, N, N) 和 (Steps, N, N, N, N)
-            # 使用 float16 节省空间
+            #
+            # 原实现使用 float16 节省空间，但在部分参数下会发生溢出/饱和（float16 最大约 6.5e4），
+            # 导致 LIOM/ITC 等物理量严重失真（例如 C(t) 爆到 > 1）。
+            # 这里改为“自适应精度”：
+            # - 默认允许 FP16（省内存）
+            # - 若检测到当前区间数据幅值过大，则自动退化到 FP32（更稳）
+            # 也可用环境变量强制选择：
+            #   PYFLOW_HYBRID_BUFFER_DTYPE=float16|float32
+            #
             # 这里的 +1 是为了存储起点
-            buffer_h2 = np.zeros((block_len + 1, n, n), dtype=np.float16)
-            buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=np.float16)
+            dtype_env = os.environ.get("PYFLOW_HYBRID_BUFFER_DTYPE", "").strip().lower()
+            if dtype_env in ("float16", "fp16"):
+                buffer_dtype = np.float16
+            elif dtype_env in ("float32", "fp32"):
+                buffer_dtype = np.float32
+            else:
+                # Heuristic: if magnitude is close to FP16 range, use FP32.
+                # Use both H2 and Hint because Hint can become large during flow.
+                try:
+                    h2_abs = float(jnp.max(jnp.abs(h2_start)))
+                    hint_abs = float(jnp.max(jnp.abs(hint_start)))
+                    max_abs = max(h2_abs, hint_abs)
+                except Exception:
+                    max_abs = float("inf")
+                # Conservative threshold below fp16 max to avoid saturation when casting trajectories.
+                buffer_dtype = np.float32 if (not np.isfinite(max_abs) or max_abs > 1.0e4) else np.float16
+
+            buffer_h2 = np.zeros((block_len + 1, n, n), dtype=buffer_dtype)
+            buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=buffer_dtype)
 
             curr_h2, curr_hint = h2_start, hint_start
             
@@ -4264,28 +4789,28 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             curr_h2.block_until_ready()
             
             # 存入起点 (JAX -> Numpy 自动发生)
-            buffer_h2[0] = np.array(curr_h2, dtype=np.float16)
-            buffer_hint[0] = np.array(curr_hint, dtype=np.float16)
+            buffer_h2[0] = np.array(curr_h2, dtype=buffer_dtype)
+            buffer_hint[0] = np.array(curr_hint, dtype=buffer_dtype)
 
             approx = _approx_enabled()
             if approx and (not norm):
                 traj2, traj4 = _approx_run_block(curr_h2, curr_hint, dl_list, t_start_idx, t_end_idx, method=method)
                 # Single host transfer per block
-                buffer_h2[:, :, :] = np.array(traj2, dtype=np.float16)
-                buffer_hint[:, :, :, :, :] = np.array(traj4, dtype=np.float16)
+                buffer_h2[:, :, :] = np.array(traj2, dtype=buffer_dtype)
+                buffer_hint[:, :, :, :, :] = np.array(traj4, dtype=buffer_dtype)
                 # 立即释放JAX轨迹数据，只保留numpy buffer
                 del traj2, traj4
             else:
                 for k in range(t_start_idx, t_end_idx):
                     steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
-                    soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+                    soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
                     curr_h2, curr_hint = soln[0][-1], soln[1][-1]
                     
                     # 存入 buffer
                     local_idx = k - t_start_idx + 1
                     curr_h2.block_until_ready() # 强制同步
-                    buffer_h2[local_idx] = np.array(curr_h2, dtype=np.float16)
-                    buffer_hint[local_idx] = np.array(curr_hint, dtype=np.float16)
+                    buffer_h2[local_idx] = np.array(curr_h2, dtype=buffer_dtype)
+                    buffer_hint[local_idx] = np.array(curr_hint, dtype=buffer_dtype)
             
             # 2. Backward: 从 buffer 读取
             l2, l4 = current_liom2, current_liom4

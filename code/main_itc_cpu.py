@@ -96,8 +96,14 @@ qmax =  5000                     # Max number of flow time steps
 norm = False                    # Normal-ordering, can be true or false
 no_state = 'SDW'                # State to use for normal-ordering, can be CDW or SDW
                                 # For vacuum normal-ordering, just set norm=False
-ladder = True                   # TEST FEATURE: compute LIOMs using creation/annihilation operators
-ITC = False                     # Infinite temp correlation function (TEST PARAMETER)
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) in ("1", "true", "True", "on", "ON", "yes", "YES")
+
+# Feature flags (default preserves legacy behavior for this script)
+# - PYFLOW_LADDER=1 enables ladder-operator LIOM/ITC branch which writes `itc`/`ed_itc`.
+#   (This file historically defaulted to ladder=True.)
+ladder = _env_flag("PYFLOW_LADDER", "1")     # compute LIOMs using creation/annihilation operators
+ITC = _env_flag("PYFLOW_ITC", "0")           # infinite temp correlation function
 Hflow = True                    # Whether to store the flowing Hamiltonian (true) or generator (false)
                                 # Storing H(l) allows SciPy ODE integration to add extra flow time steps
                                 # Storing eta(l) reduces number of tensor contractions, at cost of accuracy
@@ -124,8 +130,18 @@ dis_type = str(sys.argv[2])     # Options: 'random', 'QPgolden', 'QPsilver', 'QP
                                 # Also contains 'test' and 'QPtest', potentials that do not change from run to run
 xlist = [1.]
 
-# Checkpoint mode: only affects branches that call flow_static_int (LIOM='bck' path).
-checkpoint_mode = os.environ.get("USE_CKPT", "0") in ("1", "true", "True")
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECKPOINT MODE PARSING (align with d2 script)
+# ─────────────────────────────────────────────────────────────────────────────
+env_ckpt = os.environ.get("USE_CKPT", "0").lower()
+if env_ckpt == "hybrid":
+    checkpoint_mode = "hybrid"
+elif env_ckpt == "recursive":
+    checkpoint_mode = "recursive"
+elif env_ckpt in ("1", "true", "on"):
+    checkpoint_mode = True
+else:
+    checkpoint_mode = False
 # For 'dis_type = curved', controls the gradient of the curvature
 if intr == False:               # Zero the interactions if set to False (for ED comparison and filename)
     delta = 0

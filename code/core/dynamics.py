@@ -450,11 +450,18 @@ def dyn_itc(n,tlist,num2,H,Hint=[0],num4=[0],num6=[0],int=True):
                 avg_test += state[n//2]
                 flag = True
 
-    n2_0 = np.array(num2,dtype=np.complex128)
+    n2_0 = np.array(num2, dtype=np.complex128)
     # matb = np.deepcopy(n2_0,order='C')
-    n4_0 = np.array(num4,dtype=np.complex128)
+    n4_0 = np.array(num4, dtype=np.complex128)
+    # num6 may be absent / not computed (e.g. order=4 runs). Only use if it is truly 6D.
+    n6_0 = None
     if n <= 36:
-        n6_0 = np.array(num6,dtype=np.complex128)
+        try:
+            _tmp = np.array(num6, dtype=np.complex128)
+            if _tmp.ndim == 6:
+                n6_0 = _tmp
+        except Exception:
+            n6_0 = None
     for time in range(len(tlist)):
         # In Python (with Numba JIT)
         # itc[ns,time] += trace(n,num_t_list[time],num_t_list[0],state)
@@ -492,11 +499,12 @@ def dyn_itc(n,tlist,num2,H,Hint=[0],num4=[0],num6=[0],int=True):
         # n6t = np.copy(n6_0,order='C')
 
         # Using Cython module (dyn_cython.pyx: must be compiled before first use)
-        if n <= 36:
-            #itc[:,time] = cytrace(n,tlist[time],H,Hint,n2_0,n4_0,n6_0,statelist,np.zeros(no_states,dtype=np.complex128))
-            itc[time] = cytrace2(n,tlist[time],H,Hint,n2_0,n4_0,n6_0,statelist)
+        # cytrace2 requires a 6D n6 tensor; if n6 is not available (e.g. order=4), fall back to cytrace3.
+        if n <= 36 and n6_0 is not None:
+            # itc[:,time] = cytrace(n,tlist[time],H,Hint,n2_0,n4_0,n6_0,statelist,np.zeros(no_states,dtype=np.complex128))
+            itc[time] = cytrace2(n, tlist[time], H, Hint, n2_0, n4_0, n6_0, statelist)
         else:
-            itc[time] = cytrace3(n,tlist[time],H,Hint,n2_0,n4_0,statelist)
+            itc[time] = cytrace3(n, tlist[time], H, Hint, n2_0, n4_0, statelist)
         itc2[:,time] = cytrace_nonint(n,tlist[time],H,n2_0,statelist,np.zeros(no_states,dtype=np.complex128))
         # itc[time] *= 1.0/no_states
 

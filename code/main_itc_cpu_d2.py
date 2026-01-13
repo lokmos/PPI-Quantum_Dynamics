@@ -106,8 +106,14 @@ qmax =  1000                     # Max number of flow time steps
 norm = False                    # Normal-ordering, can be true or false
 no_state = 'SDW'                # State to use for normal-ordering, can be CDW or SDW
                                 # For vacuum normal-ordering, just set norm=False
-ladder = False                 # TEST FEATURE: compute LIOMs using creation/annihilation operators
-ITC = False                     # Infinite temp correlation function (TEST PARAMETER)
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) in ("1", "true", "True", "on", "ON", "yes", "YES")
+
+# Feature flags (default off to preserve legacy behavior)
+# - PYFLOW_LADDER=1 enables the ladder-operator LIOM/ITC branch which writes `itc`/`ed_itc`.
+# - PYFLOW_ITC=1 can be used to signal ITC-specific settings (e.g. disabling store_flow).
+ladder = _env_flag("PYFLOW_LADDER", "0")     # compute LIOMs using creation/annihilation operators
+ITC = _env_flag("PYFLOW_ITC", "0")           # infinite temp correlation function
 Hflow = True                    # Whether to store the flowing Hamiltonian (true) or generator (false)
                                 # Storing H(l) allows SciPy ODE integration to add extra flow time steps
                                 # Storing eta(l) reduces number of tensor contractions, at cost of accuracy
@@ -204,7 +210,9 @@ if __name__ == '__main__':
     
     memlog("main:start")
 
-    overwrite = os.environ.get("PYFLOW_OVERWRITE", "0") in ("1", "true", "True")
+    # Default to overwrite outputs to ensure benchmark/accuracy reruns don't get silently skipped.
+    # Set PYFLOW_OVERWRITE=0 to enable "skip if exists" behavior.
+    overwrite = os.environ.get("PYFLOW_OVERWRITE", "1") in ("1", "true", "True")
     
     total_runs = len([int(sys.argv[5])]) * len(xlist) * len(dis) * len(Ulist)
     current_run = 0
@@ -237,13 +245,21 @@ if __name__ == '__main__':
                             ham.build(n,dim,d,J,x,delta_onsite=delta,delta_up=0.,delta_down=0.,dsymm=dsymm)
                         print(f"done ({(datetime.now()-ham_init_start).total_seconds():.2f}s)")
 
-                        # Initialise the number operator on the central lattice site
-                        num = jnp.zeros((n,n))
-                        num = num.at[n//2,n//2].set(1.0)
-                        
+                        # Initialise the (local) operator used for ITC/ED comparisons.
+                        # Match ED's convention for the "central" site in 2D (see `code/ED/ed.py`).
+                        if dim == 1:
+                            location = n // 2
+                        elif dim == 2 and n % 2 == 0:
+                            location = n // 2 + int(np.sqrt(n)) // 2
+                        else:
+                            location = n // 2
+
+                        num = jnp.zeros((n, n))
+                        num = num.at[location, location].set(1.0)
+
                         # Initialise higher-order parts of number operator (empty)
-                        num_int=jnp.zeros((n,n,n,n),dtype=jnp.float64)
-                        
+                        num_int = jnp.zeros((n, n, n, n), dtype=jnp.float64)
+
                         #-----------------------------------------------------------------
 
                         # Diag non-interacting system w/NumPy

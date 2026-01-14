@@ -3951,6 +3951,13 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
 
     # NOTE: adaptive-grid probing below uses the same `update()` step as the main forward pass
     # (not odeint) to avoid mismatched evolution/metrics.
+
+    # IMPORTANT (JAX tracer safety):
+    # When USE_JIT_FLOW=1, `int_ode` may lazily call `_get_jit_ode(n)` which mutates a Python cache
+    # (and calls ex_helper/no_helper). If this happens during `odeint` tracing (adaptive grid build),
+    # JAX raises UnexpectedTracerError. Pre-warm the cache here.
+    if _USE_JIT_FLOW:
+        _get_jit_ode(int(n))
     
     # 记录原始dtype以避免在numpy转换时提升精度
     orig_dtype = H2_init.dtype
@@ -4056,10 +4063,13 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
     def _step_ode(l0: float, l1: float, h2, h4):
         """One integration step matching Phase-1 evolution (ode(int_ode, ...))."""
         steps = np.linspace(float(l0), float(l1), num=2, endpoint=True)
-        # Ensure int_ode sees the same settings as the main flow.
-        def _rhs(y, l):
-            return int_ode(y, l, method=method, norm=norm, Hflow=True)
-        soln = ode(_rhs, [h2, h4], steps, rtol=_rtol, atol=_atol)
+        # Avoid calling int_ode directly when JIT is enabled; use cached JIT RHS.
+        if _USE_JIT_FLOW:
+            soln = ode(_get_jit_ode(int(n)), [h2, h4], steps, rtol=_rtol, atol=_atol)
+        else:
+            def _rhs(y, l):
+                return int_ode(y, l, method=method, norm=norm, Hflow=True)
+            soln = ode(_rhs, [h2, h4], steps, rtol=_rtol, atol=_atol)
         return soln[0][-1], soln[1][-1]
 
     def _dtau_controller(prev_h2, prev_h4, next_h2, next_h4) -> float:
@@ -4670,6 +4680,11 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     dtype = jnp.float64 if bool(jax.config.read("jax_enable_x64")) else jnp.float32
     H2_init = jnp.array(H2, dtype=dtype)
     Hint_init = jnp.array(Hint, dtype=dtype)
+
+    # IMPORTANT (JAX tracer safety): prewarm the JIT ODE cache so odeint tracing does not
+    # mutate Python globals (which causes UnexpectedTracerError).
+    if _USE_JIT_FLOW:
+        _get_jit_ode(int(n))
     
     # Base Case Block Size (align with recursive for fair comparisons)
     BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
@@ -4677,9 +4692,152 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     # Keep ODE tolerances consistent with standard flow_static_int
     _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
     _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Adaptive grid (same controller as recursive; reduces total steps T)
+    # ─────────────────────────────────────────────────────────────────────────
+    adaptive_grid = os.environ.get("PYFLOW_ADAPTIVE_GRID", "0") in ("1", "true", "True", "on", "ON")
+    adaptive_method = os.environ.get("PYFLOW_ADAPTIVE_METHOD", "controller").strip().lower()
+    _adapt_allow_force = os.environ.get("PYFLOW_ADAPTIVE_ALLOW_FORCE", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        adapt_target = float(os.environ.get("PYFLOW_ADAPTIVE_TARGET", "1e-3"))
+    except Exception:
+        adapt_target = 1e-3
+    try:
+        adapt_min_dl = float(os.environ.get("PYFLOW_ADAPTIVE_MIN_DL", "1e-8"))
+    except Exception:
+        adapt_min_dl = 1e-8
+    try:
+        adapt_max_dl = float(os.environ.get("PYFLOW_ADAPTIVE_MAX_DL", "1e2"))
+    except Exception:
+        adapt_max_dl = 1e2
+    try:
+        adapt_max_steps = int(os.environ.get("PYFLOW_ADAPTIVE_MAX_STEPS", "20000"))
+    except Exception:
+        adapt_max_steps = 20000
+    try:
+        adapt_grow = float(os.environ.get("PYFLOW_ADAPTIVE_GROW", "2.0"))
+    except Exception:
+        adapt_grow = 2.0
+    try:
+        adapt_shrink = float(os.environ.get("PYFLOW_ADAPTIVE_SHRINK", "0.5"))
+    except Exception:
+        adapt_shrink = 0.5
+    try:
+        adapt_min_dtau = float(os.environ.get("PYFLOW_ADAPTIVE_MIN_DTAU", "1e-14"))
+    except Exception:
+        adapt_min_dtau = 1e-14
+    try:
+        adapt_log_every = int(os.environ.get("PYFLOW_ADAPTIVE_LOG_EVERY", "0"))
+    except Exception:
+        adapt_log_every = 0
+    adapt_include_h4 = os.environ.get("PYFLOW_ADAPTIVE_INCLUDE_H4", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        adapt_w4 = float(os.environ.get("PYFLOW_ADAPTIVE_W4", "1.0"))
+    except Exception:
+        adapt_w4 = 1.0
+
+    def _isfinite_all(x) -> bool:
+        try:
+            return bool(jnp.all(jnp.isfinite(x)))
+        except Exception:
+            return False
+
+    def _fro_norm(x):
+        return float(jnp.sqrt(jnp.sum(jnp.abs(x) ** 2)))
+
+    def _dtau_controller(prev_h2, prev_h4, next_h2, next_h4) -> float:
+        eps = 1e-12
+        dh2 = _fro_norm(next_h2 - prev_h2)
+        h2n = max(_fro_norm(prev_h2), _fro_norm(next_h2), eps)
+        val = dh2 / h2n
+        if adapt_include_h4:
+            dh4 = _fro_norm(next_h4 - prev_h4)
+            h4n = max(_fro_norm(prev_h4), _fro_norm(next_h4), eps)
+            val += adapt_w4 * (dh4 / h4n)
+        return float(val)
+
+    def _step_ode(l0: float, l1: float, h2, h4):
+        steps = np.linspace(float(l0), float(l1), num=2, endpoint=True)
+        if _USE_JIT_FLOW:
+            soln = ode(_get_jit_ode(int(n)), [h2, h4], steps, rtol=_rtol, atol=_atol)
+        else:
+            def _rhs(y, l):
+                return int_ode(y, l, method=method, norm=norm, Hflow=True)
+            soln = ode(_rhs, [h2, h4], steps, rtol=_rtol, atol=_atol)
+        return soln[0][-1], soln[1][-1]
+
+    def _build_adaptive_dl_list(h2_init, h4_init, l_start: float, l_end: float, dl0: float):
+        _t0 = time.perf_counter()
+        l = float(l_start)
+        dl = float(max(adapt_min_dl, min(adapt_max_dl, dl0)))
+        h2 = h2_init
+        h4 = h4_init
+        l_points = [l]
+        accepted = 0
+        retries = 0
+        hit_cap = False
+        last_dt = float("nan")
+        while (l < l_end) and (accepted < adapt_max_steps):
+            l1 = min(l_end, l + dl)
+            h2n, h4n = _step_ode(l, l1, h2, h4)
+            if (not _isfinite_all(h2n)) or (not _isfinite_all(h4n)):
+                dl = max(adapt_min_dl, dl * adapt_shrink)
+                retries += 1
+                if dl <= adapt_min_dl:
+                    break
+                continue
+            dt = _dtau_controller(h2, h4, h2n, h4n)
+            last_dt = float(dt)
+            if (not np.isfinite(dt)):
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * adapt_shrink))
+            elif dt <= adapt_min_dtau:
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * adapt_grow))
+            else:
+                ratio = adapt_target / dt
+                ratio = max(adapt_shrink, min(adapt_grow, ratio))
+                dl = max(adapt_min_dl, min(adapt_max_dl, dl * ratio))
+            l = l1
+            h2, h4 = h2n, h4n
+            l_points.append(l)
+            accepted += 1
+            if adapt_log_every and ((accepted % adapt_log_every) == 0):
+                dt_str = f"{last_dt:.3e}" if np.isfinite(last_dt) else "nan"
+                print(
+                    f"        [Adaptive Grid] build: accepted={accepted}/{adapt_max_steps} "
+                    f"l={l:.4g}/{l_end:.4g} dl={float(l_points[-1]-l_points[-2]):.3e} dtau={dt_str} "
+                    f"retries={retries} elapsed={time.perf_counter()-_t0:.1f}s",
+                    flush=True,
+                )
+        if (l < l_end) and (accepted >= adapt_max_steps):
+            hit_cap = True
+        return np.array(l_points, dtype=float), {"accepted": accepted, "retries": retries, "hit_cap": hit_cap, "l_final": float(l)}
     
     print(f"        [Hybrid Flow] Strategy: Recursive + FP16 + Contiguous Numpy Buffer")
     print(f"        [Hybrid Flow] Steps: {len(dl_list)}, Base Block: {BASE_CASE_STEPS}")
+
+    # Optional: build adaptive dl_list before Phase 1 forward pass
+    if adaptive_grid and adaptive_method == "controller" and ((forced is None) or _adapt_allow_force):
+        l_start = float(dl_list[0])
+        l_end = float(dl_list[-1])
+        dl0 = float((l_end - l_start) / max(1, (len(dl_list) - 1)))
+        print(
+            f"        [Adaptive Grid] Enabled (controller): target_dtau={adapt_target:.1e} "
+            f"min_dl={adapt_min_dl:.1e} max_dl={adapt_max_dl:.1e} max_steps={adapt_max_steps} "
+            f"include_H4={bool(adapt_include_h4)} w4={adapt_w4:g}",
+            flush=True,
+        )
+        dl_list_new, adp_stats = _build_adaptive_dl_list(H2_init, Hint_init, l_start, l_end, dl0)
+        if adp_stats.get("hit_cap", False):
+            print(
+                f"        [Adaptive Grid] WARNING: hit max_steps={adapt_max_steps} before reaching lmax "
+                f"(reached l={adp_stats.get('l_final', float('nan')):.4g}); "
+                f"falling back to original grid (steps={len(dl_list)-1}).",
+                flush=True,
+            )
+        else:
+            print(f"        [Adaptive Grid] Steps: {len(dl_list_new)-1} (was {len(dl_list)-1}) retries={adp_stats['retries']}", flush=True)
+            dl_list = dl_list_new
 
     # --- 前向积分 ---
     def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False):
@@ -4705,7 +4863,7 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     Hflow=True,
                 )
             else:
-                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=1e-6, atol=1e-8)
+                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
                 curr_h2, curr_hint = soln[0][-1], soln[1][-1]
             k += 1
             if log_progress:

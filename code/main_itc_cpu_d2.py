@@ -318,7 +318,9 @@ if __name__ == '__main__':
                             ncut = 6
 
                         # Diagonalise with ED (optional; requires QuSpin)
-                        if ED is not None and n <= ncut:
+                        # Fast benchmark mode: skip ED entirely to reduce runtime and avoid affecting mem peaks.
+                        _skip_ed = os.environ.get("PYFLOW_SKIP_ED", "0") in ("1", "true", "True", "on", "ON")
+                        if (not _skip_ed) and ED is not None and n <= ncut:
                             print("  [3.5/4] Running exact diagonalization (QuSpin)...", end=" ", flush=True)
                             ed_startTime = datetime.now()
                             if dyn == True:
@@ -332,12 +334,14 @@ if __name__ == '__main__':
                             print(f"done ({ed_endTime.total_seconds():.2f}s)")
                         else:
                             ed = np.zeros(n)
-                            if ED is None:
+                            if _skip_ed:
+                                print("        (PYFLOW_SKIP_ED=1, skipping ED)")
+                            elif ED is None:
                                 print("        (QuSpin not available, skipping ED)")
                             else:
                                 print(f"        (System too large for ED: n={n} > {ncut})")
 
-                        if (intr == False or n <= ncut) and ED is not None:
+                        if (intr == False or n <= ncut) and ED is not None and (not _skip_ed):
                             if species == 'spinless fermion':
                                 flevels = utility.flow_levels(n,flow,intr,order)
                             elif species == 'spinful fermion':
@@ -349,7 +353,7 @@ if __name__ == '__main__':
                             flevels=np.zeros(n)
                             ed=np.zeros(n)
 
-                        if (intr == False or n <= ncut) and ED is not None:
+                        if (intr == False or n <= ncut) and ED is not None and (not _skip_ed):
                             lsr = utility.level_stat(flevels)
                             lsr2 = utility.level_stat(ed)
 
@@ -363,6 +367,8 @@ if __name__ == '__main__':
                                         errlist[i] = np.abs((ed[i]-flevels[i])/ed[i])
 
                             print('***** ERROR *****: ', np.median(errlist))  
+                        elif _skip_ed:
+                            print("***** ERROR *****:  (skipped; PYFLOW_SKIP_ED=1)")
 
                         #if dyn == True:
                         #    plt.plot(tlist,ed_dyn,label=r'ED')
@@ -404,7 +410,7 @@ if __name__ == '__main__':
                                 hf.create_dataset('H2_up',data=ham.H2_spinup)
                                 hf.create_dataset('H2_dn',data=ham.H2_spindown)
 
-                            if ED is not None and n <= ncut:
+                            if (not _skip_ed) and ED is not None and n <= ncut:
                                 _h5_put(hf, 'ed_runtime', str(ed_endTime))
                                 _h5_put(hf, 'flevels', flevels, compression='gzip', compression_opts=9)
                                 _h5_put(hf, 'ed', ed, compression='gzip', compression_opts=9)

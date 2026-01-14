@@ -111,8 +111,14 @@ def parse_memlog(filepath: Path) -> dict:
         baseline_rss = min(rss_all) if rss_all else 0.0
 
     # 2. Find Peak during Flow
-    # We only look at entries AFTER the flow started
-    flow_rows = rows[flow_start_idx:]
+    # Only consider entries from main:before_flow up to main:after_flow (if present),
+    # so post-flow work (e.g. ED) cannot pollute the peak RSS.
+    flow_end_idx = None
+    for i in range(flow_start_idx, len(rows)):
+        if rows[i].get("tag") == "main:after_flow":
+            flow_end_idx = i
+            break
+    flow_rows = rows[flow_start_idx : (flow_end_idx + 1 if flow_end_idx is not None else None)]
     rss_values = [r.get("rss_mb") for r in flow_rows if "rss_mb" in r]
     
     if not rss_values:
@@ -358,7 +364,15 @@ def main():
                 cutoff = args[i]
         elif arg.startswith("--steps="):
             force_steps = arg.split("=", 1)[1]
+        elif arg.startswith("--step="):
+            # Backward-compatible alias (many earlier commands used --step)
+            force_steps = arg.split("=", 1)[1]
         elif arg == "--steps":
+            i += 1
+            if i < len(args):
+                force_steps = args[i]
+        elif arg == "--step":
+            # Backward-compatible alias
             i += 1
             if i < len(args):
                 force_steps = args[i]

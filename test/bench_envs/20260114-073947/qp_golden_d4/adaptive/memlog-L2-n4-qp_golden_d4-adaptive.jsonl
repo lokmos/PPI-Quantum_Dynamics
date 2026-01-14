@@ -1,0 +1,8 @@
+{"t_wall": 1768376457.078941, "t_mono": 191912.349667942, "pid": 99244, "tag": "main:start", "rss_bytes": 348069888, "rss_mb": 331.9453125}
+{"t_wall": 1768376457.4752662, "t_mono": 191912.745991514, "pid": 99244, "tag": "main:before_flow", "step": 0, "rss_bytes": 423567360, "rss_mb": 403.9453125, "d": 4.0, "delta": 0.1, "L": 2, "n": 4, "dim": 2}
+{"t_wall": 1768376477.0478203, "t_mono": 191932.318547577, "pid": 99244, "tag": "flow:step", "step": 10, "rss_bytes": 578797568, "rss_mb": 551.984375, "mode": "recursive_fwd"}
+{"t_wall": 1768376491.2892473, "t_mono": 191946.559972322, "pid": 99244, "tag": "flow:step", "step": 0, "rss_bytes": 605536256, "rss_mb": 577.484375, "mode": "recursive_bwd"}
+{"t_wall": 1768376492.3639193, "t_mono": 191947.634645257, "pid": 99244, "tag": "main:after_flow", "step": 0, "rss_bytes": 640663552, "rss_mb": 610.984375}
+{"t_wall": 1768376492.3643403, "t_mono": 191947.635065137, "pid": 99244, "tag": "main:before_h5_write", "step": 0, "rss_bytes": 640663552, "rss_mb": 610.984375}
+{"t_wall": 1768376492.3713825, "t_mono": 191947.642107636, "pid": 99244, "tag": "main:after_h5_write", "step": 0, "rss_bytes": 641712128, "rss_mb": 611.984375}
+{"t_wall": 1768376492.4659889, "t_mono": 191947.736715032, "pid": 99244, "tag": "main:after_gc", "step": 0, "rss_bytes": 641712128, "rss_mb": 611.984375}

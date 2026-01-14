@@ -1,0 +1,98 @@
+{
+  "meta": {
+    "L_min": 2,
+    "L_max": 10,
+    "max_steps": 600,
+    "alpha": 0.001,
+    "threshold": 10000.0,
+    "threshold_note": "fp16 overflow threshold (or conservative heuristic)",
+    "fp16_max": 65504.0,
+    "fp32_max": 3.4028234663852886e+38,
+    "mu0_base_h2": 1.0,
+    "mu0_base_h4": 5.0,
+    "mu0_power": 1.0
+  },
+  "rows": [
+    {
+      "L": 2,
+      "n": 4,
+      "growth": 1.004,
+      "mu0_h2": 2.0,
+      "mu0_h4": 20.0,
+      "step_overflow_no_scale": null,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 3,
+      "n": 9,
+      "growth": 1.009,
+      "mu0_h2": 3.0,
+      "mu0_h4": 45.0,
+      "step_overflow_no_scale": null,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 4,
+      "n": 16,
+      "growth": 1.016,
+      "mu0_h2": 4.0,
+      "mu0_h4": 80.0,
+      "step_overflow_no_scale": 305,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 5,
+      "n": 25,
+      "growth": 1.025,
+      "mu0_h2": 5.0,
+      "mu0_h4": 125.0,
+      "step_overflow_no_scale": 178,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 6,
+      "n": 36,
+      "growth": 1.036,
+      "mu0_h2": 6.0,
+      "mu0_h4": 180.0,
+      "step_overflow_no_scale": 114,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 7,
+      "n": 49,
+      "growth": 1.049,
+      "mu0_h2": 7.0,
+      "mu0_h4": 245.0,
+      "step_overflow_no_scale": 78,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 8,
+      "n": 64,
+      "growth": 1.064,
+      "mu0_h2": 8.0,
+      "mu0_h4": 320.0,
+      "step_overflow_no_scale": 56,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 9,
+      "n": 81,
+      "growth": 1.081,
+      "mu0_h2": 9.0,
+      "mu0_h4": 405.0,
+      "step_overflow_no_scale": 42,
+      "step_overflow_scaled": null
+    },
+    {
+      "L": 10,
+      "n": 100,
+      "growth": 1.1,
+      "mu0_h2": 10.0,
+      "mu0_h4": 500.0,
+      "step_overflow_no_scale": 32,
+      "step_overflow_scaled": null
+    }
+  ]
+}

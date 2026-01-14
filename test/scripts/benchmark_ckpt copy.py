@@ -194,6 +194,12 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         env.setdefault("PYFLOW_ADAPTIVE_MAX_STEPS", "20000")
         # Progress prints for "grid building" so it never looks stuck
         env.setdefault("PYFLOW_ADAPTIVE_LOG_EVERY", "200")
+    if mode == "hybrid":
+        # Hybrid in the copy branch is "progressive": includes dynamic exponent scaling (default on)
+        # and Phase-2 sparsity pruning.
+        env.setdefault("PYFLOW_HYBRID_EXP_SCALE", "1")
+        env.setdefault("PYFLOW_HYBRID_PRUNE", "1")
+        env.setdefault("PYFLOW_PRUNE_EPS", "1e-7")
     env["PYFLOW_MEMLOG_FILE"] = str(memlog_path)
 
     cmd = [
@@ -353,6 +359,10 @@ def main():
             if i < len(args): plan_str = args[i]
         elif arg.startswith("--mode="):
             mode_arg = arg.split("=", 1)[1]
+        elif arg == "--mode":
+            i += 1
+            if i < len(args):
+                mode_arg = args[i]
         elif arg in ("--verbose", "-v"):
             verbose = True
         elif arg == "--jit":

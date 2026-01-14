@@ -1,0 +1,3 @@
+{"t_wall": 1768378099.262781, "t_mono": 193554.533507511, "pid": 104972, "tag": "main:start", "rss_bytes": 348106752, "rss_mb": 331.98046875}
+{"t_wall": 1768378099.6769936, "t_mono": 193554.947718747, "pid": 104972, "tag": "main:before_flow", "step": 0, "rss_bytes": 424652800, "rss_mb": 404.98046875, "d": 1.0, "delta": 0.1, "L": 2, "n": 4, "dim": 2}
+{"t_wall": 1768378099.9746692, "t_mono": 193555.245394561, "pid": 104972, "tag": "flow:alloc", "step": 0, "rss_bytes": 439447552, "rss_mb": 419.08984375, "mode": "original", "kind": "sol2/sol4", "steps": 1000, "n": 4}

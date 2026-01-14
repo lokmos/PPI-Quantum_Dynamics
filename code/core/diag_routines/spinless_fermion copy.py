@@ -5009,9 +5009,49 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 # Conservative threshold below fp16 max to avoid saturation when casting trajectories.
                 buffer_dtype = np.float32 if (not np.isfinite(max_abs) or max_abs > 1.0e4) else np.float16
 
-            buffer_h2 = np.zeros((block_len + 1, n, n), dtype=buffer_dtype)
-            buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=buffer_dtype)
             exp_scale = os.environ.get("PYFLOW_HYBRID_EXP_SCALE", "1") in ("1", "true", "True", "on", "ON")
+            # Phase-2 pruning (sparsity & significance filtering) for CPU RAM:
+            # Store only "meaningful" elements in COO-like form, per snapshot.
+            # - Hard-threshold: keep |x| >= eps
+            # - Active-space filter (optional): only keep entries touching "active sites"
+            # Default off to preserve baseline behavior.
+            prune = os.environ.get("PYFLOW_HYBRID_PRUNE", "0") in ("1", "true", "True", "on", "ON")
+            try:
+                prune_eps = float(os.environ.get("PYFLOW_PRUNE_EPS", "1e-7"))
+            except Exception:
+                prune_eps = 1e-7
+            try:
+                active_radius = int(os.environ.get("PYFLOW_PRUNE_ACTIVE_RADIUS", "-1"))
+            except Exception:
+                active_radius = -1
+
+            # Precompute active sites (2D only) if requested.
+            active_site = None
+            if active_radius >= 0:
+                try:
+                    Lside = int(round(float(n) ** 0.5))
+                    if Lside * Lside == int(n) and Lside > 0:
+                        cx, cy = Lside // 2, Lside // 2
+                        act = np.zeros((n,), dtype=np.bool_)
+                        for s in range(n):
+                            x, y = divmod(s, Lside)
+                            if (abs(x - cx) + abs(y - cy)) <= active_radius:
+                                act[s] = True
+                        active_site = act
+                except Exception:
+                    active_site = None
+
+            if not prune:
+                buffer_h2 = np.zeros((block_len + 1, n, n), dtype=buffer_dtype)
+                buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=buffer_dtype)
+            else:
+                # Sparse COO storage: concatenate indices/values across snapshots with ptr offsets.
+                h2_ptr = [0]
+                h2_idx_chunks: list[np.ndarray] = []
+                h2_val_chunks: list[np.ndarray] = []
+                hint_ptr = [0]
+                hint_idx_chunks: list[np.ndarray] = []
+                hint_val_chunks: list[np.ndarray] = []
             # Store per-snapshot scaling factors in high precision (scalar only; negligible memory)
             scale_h2 = np.ones((block_len + 1,), dtype=np.float32)
             scale_hint = np.ones((block_len + 1,), dtype=np.float32)
@@ -5032,34 +5072,97 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             # 必须先把 JAX 数组 block 住，确保计算完成
             curr_h2.block_until_ready()
             
-            # 存入起点 (JAX -> Numpy 自动发生)
-            if exp_scale:
-                mu2 = _safe_mu_jax(curr_h2)
-                mu4 = _safe_mu_jax(curr_hint)
-                scale_h2[0] = np.float32(mu2)
-                scale_hint[0] = np.float32(mu4)
-                buffer_h2[0] = np.array(curr_h2 / mu2, dtype=buffer_dtype)
-                buffer_hint[0] = np.array(curr_hint / mu4, dtype=buffer_dtype)
+            def _append_sparse_snapshot(local_idx: int, h2_jax, h4_jax) -> None:
+                mu2 = _safe_mu_jax(h2_jax) if exp_scale else 1.0
+                mu4 = _safe_mu_jax(h4_jax) if exp_scale else 1.0
+                scale_h2[local_idx] = np.float32(mu2)
+                scale_hint[local_idx] = np.float32(mu4)
+
+                # Store normalized (or raw) snapshots into low-precision numpy arrays
+                h2_np = np.array((h2_jax / mu2) if exp_scale else h2_jax, dtype=buffer_dtype)
+                h4_np = np.array((h4_jax / mu4) if exp_scale else h4_jax, dtype=buffer_dtype)
+
+                # Threshold in the stored domain:
+                # If exp_scale: stored values are divided by mu, so absolute threshold becomes eps/mu.
+                th2 = (prune_eps / mu2) if exp_scale else prune_eps
+                th4 = (prune_eps / mu4) if exp_scale else prune_eps
+                if th2 <= 0.0:
+                    th2 = 0.0
+                if th4 <= 0.0:
+                    th4 = 0.0
+
+                # H2 sparse
+                h2_flat = h2_np.reshape(-1)
+                h2_mask = np.abs(h2_flat) >= th2
+                h2_idx = np.flatnonzero(h2_mask).astype(np.int32, copy=False)
+                if active_site is not None and h2_idx.size:
+                    ii = (h2_idx // n)
+                    jj = (h2_idx - ii * n)
+                    keep = active_site[ii] | active_site[jj]
+                    h2_idx = h2_idx[keep]
+                h2_val = h2_flat[h2_idx].astype(buffer_dtype, copy=False) if h2_idx.size else np.zeros((0,), dtype=buffer_dtype)
+                h2_idx_chunks.append(h2_idx)
+                h2_val_chunks.append(h2_val)
+                h2_ptr.append(h2_ptr[-1] + int(h2_idx.size))
+
+                # H4 sparse
+                h4_flat = h4_np.reshape(-1)
+                h4_mask = np.abs(h4_flat) >= th4
+                h4_idx = np.flatnonzero(h4_mask).astype(np.int32, copy=False)
+                if active_site is not None and h4_idx.size:
+                    n2 = n * n
+                    n3 = n2 * n
+                    i0 = (h4_idx // n3)
+                    rem = (h4_idx - i0 * n3)
+                    j0 = (rem // n2)
+                    rem2 = (rem - j0 * n2)
+                    k0 = (rem2 // n)
+                    l0 = (rem2 - k0 * n)
+                    keep = active_site[i0] | active_site[j0] | active_site[k0] | active_site[l0]
+                    h4_idx = h4_idx[keep]
+                h4_val = h4_flat[h4_idx].astype(buffer_dtype, copy=False) if h4_idx.size else np.zeros((0,), dtype=buffer_dtype)
+                hint_idx_chunks.append(h4_idx)
+                hint_val_chunks.append(h4_val)
+                hint_ptr.append(hint_ptr[-1] + int(h4_idx.size))
+
+                # Free temporary dense numpy arrays ASAP
+                del h2_np, h4_np, h2_flat, h4_flat, h2_mask, h4_mask
+
+            # 存入起点 (JAX -> Numpy)
+            if not prune:
+                if exp_scale:
+                    mu2 = _safe_mu_jax(curr_h2)
+                    mu4 = _safe_mu_jax(curr_hint)
+                    scale_h2[0] = np.float32(mu2)
+                    scale_hint[0] = np.float32(mu4)
+                    buffer_h2[0] = np.array(curr_h2 / mu2, dtype=buffer_dtype)
+                    buffer_hint[0] = np.array(curr_hint / mu4, dtype=buffer_dtype)
+                else:
+                    buffer_h2[0] = np.array(curr_h2, dtype=buffer_dtype)
+                    buffer_hint[0] = np.array(curr_hint, dtype=buffer_dtype)
             else:
-                buffer_h2[0] = np.array(curr_h2, dtype=buffer_dtype)
-                buffer_hint[0] = np.array(curr_hint, dtype=buffer_dtype)
+                _append_sparse_snapshot(0, curr_h2, curr_hint)
 
             approx = _approx_enabled()
             if approx and (not norm):
                 traj2, traj4 = _approx_run_block(curr_h2, curr_hint, dl_list, t_start_idx, t_end_idx, method=method)
-                if exp_scale:
-                    # Scale per snapshot (small block_len), avoids overflow in low precision storage
-                    for jj in range(block_len + 1):
-                        mu2 = _safe_mu_jax(traj2[jj])
-                        mu4 = _safe_mu_jax(traj4[jj])
-                        scale_h2[jj] = np.float32(mu2)
-                        scale_hint[jj] = np.float32(mu4)
-                        buffer_h2[jj] = np.array(traj2[jj] / mu2, dtype=buffer_dtype)
-                        buffer_hint[jj] = np.array(traj4[jj] / mu4, dtype=buffer_dtype)
+                if not prune:
+                    if exp_scale:
+                        # Scale per snapshot (small block_len), avoids overflow in low precision storage
+                        for jj in range(block_len + 1):
+                            mu2 = _safe_mu_jax(traj2[jj])
+                            mu4 = _safe_mu_jax(traj4[jj])
+                            scale_h2[jj] = np.float32(mu2)
+                            scale_hint[jj] = np.float32(mu4)
+                            buffer_h2[jj] = np.array(traj2[jj] / mu2, dtype=buffer_dtype)
+                            buffer_hint[jj] = np.array(traj4[jj] / mu4, dtype=buffer_dtype)
+                    else:
+                        # Single host transfer per block
+                        buffer_h2[:, :, :] = np.array(traj2, dtype=buffer_dtype)
+                        buffer_hint[:, :, :, :, :] = np.array(traj4, dtype=buffer_dtype)
                 else:
-                    # Single host transfer per block
-                    buffer_h2[:, :, :] = np.array(traj2, dtype=buffer_dtype)
-                    buffer_hint[:, :, :, :, :] = np.array(traj4, dtype=buffer_dtype)
+                    for jj in range(block_len + 1):
+                        _append_sparse_snapshot(jj, traj2[jj], traj4[jj])
                 # 立即释放JAX轨迹数据，只保留numpy buffer
                 del traj2, traj4
             else:
@@ -5071,17 +5174,37 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     # 存入 buffer
                     local_idx = k - t_start_idx + 1
                     curr_h2.block_until_ready() # 强制同步
-                    if exp_scale:
-                        mu2 = _safe_mu_jax(curr_h2)
-                        mu4 = _safe_mu_jax(curr_hint)
-                        scale_h2[local_idx] = np.float32(mu2)
-                        scale_hint[local_idx] = np.float32(mu4)
-                        buffer_h2[local_idx] = np.array(curr_h2 / mu2, dtype=buffer_dtype)
-                        buffer_hint[local_idx] = np.array(curr_hint / mu4, dtype=buffer_dtype)
+                    if not prune:
+                        if exp_scale:
+                            mu2 = _safe_mu_jax(curr_h2)
+                            mu4 = _safe_mu_jax(curr_hint)
+                            scale_h2[local_idx] = np.float32(mu2)
+                            scale_hint[local_idx] = np.float32(mu4)
+                            buffer_h2[local_idx] = np.array(curr_h2 / mu2, dtype=buffer_dtype)
+                            buffer_hint[local_idx] = np.array(curr_hint / mu4, dtype=buffer_dtype)
+                        else:
+                            buffer_h2[local_idx] = np.array(curr_h2, dtype=buffer_dtype)
+                            buffer_hint[local_idx] = np.array(curr_hint, dtype=buffer_dtype)
                     else:
-                        buffer_h2[local_idx] = np.array(curr_h2, dtype=buffer_dtype)
-                        buffer_hint[local_idx] = np.array(curr_hint, dtype=buffer_dtype)
+                        _append_sparse_snapshot(local_idx, curr_h2, curr_hint)
             
+            # Finalize sparse buffers (concatenate) before backward sweep
+            if prune:
+                if h2_idx_chunks:
+                    h2_idx = np.concatenate(h2_idx_chunks).astype(np.int32, copy=False)
+                    h2_val = np.concatenate(h2_val_chunks).astype(buffer_dtype, copy=False)
+                else:
+                    h2_idx = np.zeros((0,), dtype=np.int32)
+                    h2_val = np.zeros((0,), dtype=buffer_dtype)
+                if hint_idx_chunks:
+                    hint_idx = np.concatenate(hint_idx_chunks).astype(np.int32, copy=False)
+                    hint_val = np.concatenate(hint_val_chunks).astype(buffer_dtype, copy=False)
+                else:
+                    hint_idx = np.zeros((0,), dtype=np.int32)
+                    hint_val = np.zeros((0,), dtype=buffer_dtype)
+                # Release chunk lists to reduce Python overhead
+                del h2_idx_chunks, h2_val_chunks, hint_idx_chunks, hint_val_chunks
+
             # 2. Backward: 从 buffer 读取
             l2, l4 = current_liom2, current_liom4
             
@@ -5089,19 +5212,50 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 global_step = t_start_idx + i
                 local_idx = i # 对应 buffer 中的位置
                 
-                # Restore from Numpy buffer into JAX arrays (match configured dtype)
-                if exp_scale:
-                    h2_now = jnp.array(buffer_h2[local_idx], dtype=dtype) * jnp.array(scale_h2[local_idx], dtype=dtype)
-                    hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype) * jnp.array(scale_hint[local_idx], dtype=dtype)
+                # Restore from storage into JAX arrays (match configured dtype)
+                if not prune:
+                    if exp_scale:
+                        h2_now = jnp.array(buffer_h2[local_idx], dtype=dtype) * jnp.array(scale_h2[local_idx], dtype=dtype)
+                        hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype) * jnp.array(scale_hint[local_idx], dtype=dtype)
+                    else:
+                        h2_now = jnp.array(buffer_h2[local_idx], dtype=dtype)
+                        hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype)
                 else:
-                    h2_now = jnp.array(buffer_h2[local_idx], dtype=dtype)
-                    hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype)
+                    # Materialize dense tensors on-the-fly from sparse COO in CPU RAM.
+                    # Note: this keeps only sparse data resident across the block.
+                    start2, end2 = int(h2_ptr[local_idx]), int(h2_ptr[local_idx + 1])
+                    idx2 = h2_idx[start2:end2]
+                    val2 = h2_val[start2:end2]
+                    # Dense H2
+                    dense_dtype = np.float64 if dtype == jnp.float64 else np.float32
+                    h2_dense = np.zeros((n * n,), dtype=dense_dtype)
+                    if idx2.size:
+                        h2_dense[idx2.astype(np.int64, copy=False)] = val2.astype(dense_dtype, copy=False)
+                    h2_dense = h2_dense.reshape((n, n))
+                    if exp_scale:
+                        h2_dense *= float(scale_h2[local_idx])
+                    h2_now = jnp.array(h2_dense, dtype=dtype)
+
+                    start4, end4 = int(hint_ptr[local_idx]), int(hint_ptr[local_idx + 1])
+                    idx4 = hint_idx[start4:end4]
+                    val4 = hint_val[start4:end4]
+                    # Dense H4/Hint
+                    h4_dense = np.zeros((n**4,), dtype=dense_dtype)
+                    if idx4.size:
+                        h4_dense[idx4.astype(np.int64, copy=False)] = val4.astype(dense_dtype, copy=False)
+                    h4_dense = h4_dense.reshape((n, n, n, n))
+                    if exp_scale:
+                        h4_dense *= float(scale_hint[local_idx])
+                    hint_now = jnp.array(h4_dense, dtype=dtype)
                 
                 t_span_bck = np.linspace(dl_list[global_step+1], dl_list[global_step], num=2, endpoint=True)
                 l2, l4 = jit_update(l2, l4, h2_now, hint_now, t_span_bck)
             
             # 3. 显式释放大块内存
-            del buffer_h2, buffer_hint, scale_h2, scale_hint
+            if not prune:
+                del buffer_h2, buffer_hint, scale_h2, scale_hint
+            else:
+                del h2_idx, h2_val, hint_idx, hint_val, h2_ptr, hint_ptr, scale_h2, scale_hint
             gc.collect()
             
             return l2, l4
@@ -5134,4 +5288,29 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
         "truncation_err": np.array([0.,0.,0.,0.])
     }
     return output
+
+
+def flow_static_int_hybrid_pruned(
+    n,
+    hamiltonian,
+    dl_list,
+    qmax,
+    cutoff,
+    method='tensordot',
+    norm=False,
+    Hflow=False,
+    store_flow=False,
+):
+    """
+    Wrapper for Hybrid with Phase-2 sparsity/pruning enabled.
+
+    Enable:
+      - PYFLOW_HYBRID_PRUNE=1
+    Optional knobs:
+      - PYFLOW_PRUNE_EPS (default 1e-7)
+      - PYFLOW_PRUNE_ACTIVE_RADIUS (default -1: disabled)
+      - PYFLOW_HYBRID_EXP_SCALE=1 (default on)
+    """
+    os.environ["PYFLOW_HYBRID_PRUNE"] = "1"
+    return flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method=method, norm=norm, Hflow=Hflow, store_flow=store_flow)
 

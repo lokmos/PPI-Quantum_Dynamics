@@ -17,6 +17,7 @@ Optional:
   python test/scripts/benchmark_envs_original_vs_tau.py --L 3 10
   python test/scripts/benchmark_envs_original_vs_tau.py --only-env random_d1 qp_golden_d1
   python test/scripts/benchmark_envs_original_vs_tau.py --no-jit
+  python test/scripts/benchmark_envs_original_vs_tau.py --L 5 8 --cutoff 1e-2 --tol 1e-2
 """
 
 from __future__ import annotations
@@ -41,9 +42,9 @@ MAIN = CODE_DIR / "main_itc_cpu_d2.py"
 # Fixed L ranges (paper-oriented)
 # -----------------------------------------------------------------------------
 # Original is more memory-hungry; cap at smaller L.
-ORIG_L_MIN, ORIG_L_MAX = 2, 8
+ORIG_L_MIN, ORIG_L_MAX = 6, 8
 # Adaptive (on recursive) can scale further; extend L if desired.
-ADAPT_L_MIN, ADAPT_L_MAX = 2, 8
+ADAPT_L_MIN, ADAPT_L_MAX = 5, 8
 
 
 # -----------------------------------------------------------------------------
@@ -178,6 +179,7 @@ def run_case(
     mode: str,
     use_jit_flow: bool,
     run_dir: Path,
+    base_env: dict[str, str],
 ) -> dict[str, Any]:
     """Run a single (env, L, mode) benchmark and return stats dict."""
     assert mode in ("original", "adaptive")
@@ -188,7 +190,7 @@ def run_case(
     memlog_path = out_dir / f"memlog-L{L}-n{n}-{env_case.key}-{mode}.jsonl"
 
     env = os.environ.copy()
-    env.update(BASE_ENV)
+    env.update(base_env)
     env["USE_JIT_FLOW"] = "1" if use_jit_flow else "0"
     env["PYFLOW_MEMLOG_FILE"] = str(memlog_path)
     if env_case.extra_env:
@@ -246,7 +248,17 @@ def run_case(
     return stats
 
 
-def print_table(results: list[dict[str, Any]], env_keys: list[str], L_min: int, L_max: int) -> None:
+def print_table(
+    results: list[dict[str, Any]],
+    env_keys: list[str],
+    L_min: int,
+    L_max: int,
+    *,
+    cutoff: str,
+    ode_tol: str,
+    force_steps: str,
+    memlog_every: str,
+) -> None:
     # Group by env then by L
     by_env: dict[str, dict[int, dict[str, dict[str, Any]]]] = {}
     for r in results:
@@ -254,7 +266,9 @@ def print_table(results: list[dict[str, Any]], env_keys: list[str], L_min: int, 
 
     print("\n" + "=" * 120)
     print("BENCHMARK (2D spinless fermion): Original vs Adaptive (on recursive)")
-    print(f"Fixed: method={FIXED_METHOD} cutoff={FIXED_CUTOFF} ode_tol={FIXED_ODE_TOL} steps={FIXED_FORCE_STEPS} memlog_every={FIXED_MEMLOG_EVERY}")
+    print(
+        f"Settings: method={FIXED_METHOD} cutoff={cutoff} ode_tol={ode_tol} steps={force_steps} memlog_every={memlog_every}"
+    )
     print("=" * 120)
 
     for env_key in env_keys:
@@ -297,11 +311,30 @@ def main() -> None:
         nargs=2,
         type=int,
         default=None,
-        help="Override L range for BOTH modes: L_min L_max (inclusive). If omitted, use paper defaults (orig 2..8, recursive_tau 2..10).",
+        help="Override L range for BOTH modes: L_min L_max (inclusive). If omitted, use paper defaults (orig 2..8, adaptive 2..8).",
     )
     ap.add_argument("--only-env", nargs="*", default=None, help="Subset of env keys to run (space-separated)")
     ap.add_argument("--no-jit", action="store_true", help="Disable USE_JIT_FLOW (avoid compile overhead)")
+    ap.add_argument(
+        "--cutoff",
+        type=str,
+        default=None,
+        help=f"Override truncation cutoff (maps to PYFLOW_CUTOFF). Default is {FIXED_CUTOFF}.",
+    )
+    ap.add_argument(
+        "--tol",
+        type=str,
+        default=None,
+        help=f"Override ODE tolerance (rtol=atol; maps to PYFLOW_ODE_RTOL/ATOL). Default is {FIXED_ODE_TOL}.",
+    )
     args = ap.parse_args()
+
+    cutoff = str(args.cutoff) if args.cutoff is not None else FIXED_CUTOFF
+    ode_tol = str(args.tol) if args.tol is not None else FIXED_ODE_TOL
+    base_env = dict(BASE_ENV)
+    base_env["PYFLOW_CUTOFF"] = cutoff
+    base_env["PYFLOW_ODE_RTOL"] = ode_tol
+    base_env["PYFLOW_ODE_ATOL"] = ode_tol
 
     # For printing tables (cover full union of L across modes)
     if args.L is None:
@@ -342,6 +375,7 @@ def main() -> None:
     print(f"- Modes: ['original', 'adaptive']")
     print(f"- Run dir: {run_dir}")
     print(f"- USE_JIT_FLOW: {'ON' if use_jit else 'OFF'}")
+    print(f"- cutoff: {cutoff} | ode_tol: {ode_tol} | force_steps: {FIXED_FORCE_STEPS} | memlog_every: {FIXED_MEMLOG_EVERY}")
     print("=" * 120)
 
     results: list[dict[str, Any]] = []
@@ -351,7 +385,7 @@ def main() -> None:
         for env_case in env_cases:
             # original
             print(f"\n[RUN] env={env_case.key} L={L} mode=original ...", flush=True)
-            r = run_case(L, env_case, "original", use_jit, run_dir)
+            r = run_case(L, env_case, "original", use_jit, run_dir, base_env)
             results.append(r)
             if r.get("status") != "ok":
                 print("  [FAILED]")
@@ -364,7 +398,7 @@ def main() -> None:
             # adaptive for the same L (only if within adaptive range)
             if adapt_L_min <= L <= adapt_L_max:
                 print(f"\n[RUN] env={env_case.key} L={L} mode=adaptive ...", flush=True)
-                r = run_case(L, env_case, "adaptive", use_jit, run_dir)
+                r = run_case(L, env_case, "adaptive", use_jit, run_dir, base_env)
                 results.append(r)
                 if r.get("status") != "ok":
                     print("  [FAILED]")
@@ -380,7 +414,7 @@ def main() -> None:
         for L in range(adapt_only_start, adapt_L_max + 1):
             for env_case in env_cases:
                 print(f"\n[RUN] env={env_case.key} L={L} mode=adaptive ...", flush=True)
-                r = run_case(L, env_case, "adaptive", use_jit, run_dir)
+                r = run_case(L, env_case, "adaptive", use_jit, run_dir, base_env)
                 results.append(r)
                 if r.get("status") != "ok":
                     print("  [FAILED]")
@@ -395,7 +429,16 @@ def main() -> None:
     out_json.write_text(json.dumps({"run_dir": str(run_dir), "results": results}, indent=2))
     print(f"\nSaved: {out_json}")
 
-    print_table(results, [e.key for e in env_cases], L_min_all, L_max_all)
+    print_table(
+        results,
+        [e.key for e in env_cases],
+        L_min_all,
+        L_max_all,
+        cutoff=cutoff,
+        ode_tol=ode_tol,
+        force_steps=FIXED_FORCE_STEPS,
+        memlog_every=FIXED_MEMLOG_EVERY,
+    )
     print(f"\nTotal wall time: {time.time() - t0:.1f}s")
 
 

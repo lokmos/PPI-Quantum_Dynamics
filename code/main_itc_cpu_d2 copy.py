@@ -30,6 +30,7 @@ and save the output as an HDF5 file containing various different datasets.
 """
 
 import os, sys
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # Environment configuration MUST happen before any JAX import
@@ -79,24 +80,34 @@ except Exception:
 # This script is a sandbox for experiments. It *always* loads
 # `core/diag_routines/spinless_fermion copy.py` and patches `core.diag`'s dispatch
 # targets (flow_static_int_recursive/hybrid) to point to the copy implementations.
+_flow_hybrid_original = None
 try:
     import importlib.util as _importlib_util
+    import sys as _sys
 
     _copy_path = (Path(__file__).resolve().parent / "core" / "diag_routines" / "spinless_fermion copy.py").resolve()
-    _spec = _importlib_util.spec_from_file_location("pyflow_spinless_fermion_copy", str(_copy_path))
+    # IMPORTANT:
+    # The copy routine file uses relative imports (e.g. from ..contract import ...),
+    # so we must load it as a submodule of the `core.diag_routines` package.
+    _mod_name = "core.diag_routines.spinless_fermion_copy"
+    _spec = _importlib_util.spec_from_file_location(_mod_name, str(_copy_path))
     if _spec is not None and _spec.loader is not None:
         _mod = _importlib_util.module_from_spec(_spec)
+        # Ensure relative imports inside the module resolve correctly.
+        _sys.modules[_mod_name] = _mod
         _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
         # Patch dispatch entrypoints used by core.diag.CUT (names are imported into diag module namespace).
         if hasattr(diag, "flow_static_int_recursive") and hasattr(_mod, "flow_static_int_recursive"):
             diag.flow_static_int_recursive = _mod.flow_static_int_recursive  # type: ignore[attr-defined]
         if hasattr(diag, "flow_static_int_hybrid") and hasattr(_mod, "flow_static_int_hybrid"):
             diag.flow_static_int_hybrid = _mod.flow_static_int_hybrid  # type: ignore[attr-defined]
+        # For hybrid-original we call the copy routine directly (diag.py does not know this mode).
+        _flow_hybrid_original = getattr(_mod, "flow_static_int_hybrid_original", None)
         print(f"[COPY ROUTINES] Patched diag routines from: {_copy_path}", flush=True)
     else:
         print(f"[COPY ROUTINES] WARNING: failed to load spec for {_copy_path}", flush=True)
 except Exception as _e:
-    print(f"[COPY ROUTINES] WARNING: patching failed: {_e}", flush=True)
+    print(f"[COPY ROUTINES] WARNING: patching failed: {type(_e).__name__}: {_e}", flush=True)
 
 #------------------------------------------------------------------------------  
 # Parameters
@@ -196,7 +207,10 @@ if ITC == True:
 # CHECKPOINT MODE PARSING (Modified)
 # ─────────────────────────────────────────────────────────────────────────────
 env_ckpt = os.environ.get("USE_CKPT", "0").lower()
-if env_ckpt == "hybrid":
+if env_ckpt in ("hybrid-original", "hybrid_original", "hybrid-orig", "hybrid_orig"):
+    checkpoint_mode = "hybrid-original"
+    ckpt_status_str = "ON (Hybrid-Original)"
+elif env_ckpt == "hybrid":
     checkpoint_mode = "hybrid"      # <--- 新增
     ckpt_status_str = "ON (Hybrid)" # <--- 新增
 elif env_ckpt == "recursive":
@@ -311,6 +325,8 @@ if __name__ == '__main__':
                                 # Prioritize params (from env parsing above)
                                 if params["checkpoint_mode"] == "hybrid":
                                     mode_str = "hybrid"
+                                elif params["checkpoint_mode"] == "hybrid-original":
+                                    mode_str = "hybrid-original"
                                 elif params["checkpoint_mode"] == "recursive":
                                     mode_str = "recursive"
                                 elif params["checkpoint_mode"] is True:
@@ -332,7 +348,22 @@ if __name__ == '__main__':
                         print("  [3/4] Running flow equations...", flush=True)
                         memlog("main:before_flow", step=p, d=float(d), delta=float(delta), L=int(L), n=int(n), dim=int(dim))
                         flow_startTime = datetime.now()
-                        flow = diag.CUT(params,ham,num,num_int)
+                        if params.get("checkpoint_mode", None) == "hybrid-original":
+                            # Explicit dispatch: keep all hybrid changes in copy routines only.
+                            if _flow_hybrid_original is None:
+                                raise RuntimeError("hybrid-original requested but flow_static_int_hybrid_original not found in spinless_fermion copy.py")
+                            # Build dl_list (match core.diag.CUT behavior)
+                            if logflow is False:
+                                dl = np.linspace(0, lmax, qmax, endpoint=True)
+                            else:
+                                print("Warning: careful choices of qmax and lmax required for log flow.")
+                                dl = np.logspace(np.log10(0.001), np.log10(lmax), qmax, endpoint=True, base=10)
+                            flow = _flow_hybrid_original(
+                                n, ham, dl, qmax, cutoff,
+                                method=method, norm=norm, Hflow=Hflow, store_flow=store_flow,
+                            )
+                        else:
+                            flow = diag.CUT(params,ham,num,num_int)
                         flow_endTime = datetime.now()-flow_startTime
                         memlog("main:after_flow", step=p)
                         print(f"        Flow completed in {flow_endTime.total_seconds():.2f}s")

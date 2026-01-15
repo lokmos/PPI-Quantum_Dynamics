@@ -1,0 +1,2 @@
+{"t_wall": 1768446198.0423872, "t_mono": 261653.31311307, "pid": 121130, "tag": "main:start", "rss_bytes": 348651520, "rss_mb": 332.5}
+{"t_wall": 1768446198.4919987, "t_mono": 261653.762724241, "pid": 121130, "tag": "main:before_flow", "step": 0, "rss_bytes": 424148992, "rss_mb": 404.5, "d": 1.0, "delta": 0.1, "L": 2, "n": 4, "dim": 2}

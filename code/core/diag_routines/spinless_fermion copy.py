@@ -2198,6 +2198,456 @@ def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hfl
     return output
 
 
+# ------------------------------------------------------------------------------
+# Hybrid-Original: Original route + Projection-based Tensor Compression (Hybrid-SVD)
+# ------------------------------------------------------------------------------
+def flow_static_int_hybrid_original(
+    n,
+    hamiltonian,
+    dl_list,
+    qmax,
+    cutoff,
+    method="tensordot",
+    norm=False,
+    Hflow=False,
+    store_flow=False,
+):
+    """
+    Hybrid-Original mode:
+    - Keep the ORIGINAL algorithmic route (no recursive/ckpt recomputation).
+    - Replace the O(T * n^4) dense trajectory storage (sol2/sol4) with Randomized SVD (rSVD)
+      low-rank factors per snapshot. Backward/forward LIOM integration decompresses on-the-fly.
+
+    Enable this mode from the driver via:
+      USE_CKPT=hybrid-original
+
+    Tunables (env vars, same naming as Hybrid-SVD):
+      - PYFLOW_HYBRID_SVD_RANK_H2 (default 16)
+      - PYFLOW_HYBRID_SVD_RANK_H4 (default 64)   # applied on reshape(H4) -> (n^2, n^2)
+      - PYFLOW_HYBRID_SVD_OVERSAMPLE (default 8)
+      - PYFLOW_HYBRID_SVD_NITER (default 1)
+      - PYFLOW_HYBRID_SVD_STORE_DTYPE=float16|float32 (default float16)
+      - PYFLOW_HYBRID_EXP_SCALE=1|0 (default 1): normalize by mu=max(|H|) before compression
+    """
+    forced = _force_steps()
+    if forced is not None:
+        dl_list = dl_list[: min(len(dl_list), forced + 1)]
+        print(f"        [FORCE_STEPS] Running exactly {len(dl_list)-1} steps (ignoring cutoff)")
+
+    # Inputs
+    H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+    H2_init = jnp.array(H2)
+    Hint_init = jnp.array(Hint)
+    dtype = H2_init.dtype
+
+    increment = 2
+    _rtol = float(os.environ.get("PYFLOW_ODE_RTOL", "1e-6"))
+    _atol = float(os.environ.get("PYFLOW_ODE_ATOL", "1e-6"))
+
+    # SVD knobs
+    try:
+        svd_rank_h2 = int(os.environ.get("PYFLOW_HYBRID_SVD_RANK_H2", "16"))
+    except Exception:
+        svd_rank_h2 = 16
+    try:
+        svd_rank_h4 = int(os.environ.get("PYFLOW_HYBRID_SVD_RANK_H4", "64"))
+    except Exception:
+        svd_rank_h4 = 64
+    try:
+        svd_oversample = int(os.environ.get("PYFLOW_HYBRID_SVD_OVERSAMPLE", "8"))
+    except Exception:
+        svd_oversample = 8
+    try:
+        svd_niter = int(os.environ.get("PYFLOW_HYBRID_SVD_NITER", "1"))
+    except Exception:
+        svd_niter = 1
+    svd_store_dtype_env = os.environ.get("PYFLOW_HYBRID_SVD_STORE_DTYPE", "float16").strip().lower()
+    svd_store_dtype = np.float32 if svd_store_dtype_env in ("float32", "fp32") else np.float16
+    exp_scale = os.environ.get("PYFLOW_HYBRID_EXP_SCALE", "1") in ("1", "true", "True", "on", "ON")
+    # COO (sparsity) knobs: when enabled, we build a dense sub-block from COO support then apply rSVD.
+    # This realizes the full 3-stage pipeline: DES + COO + SVD.
+    coo_enable = os.environ.get("PYFLOW_HYBRID_PRUNE", "0") in ("1", "true", "True", "on", "ON")
+    try:
+        prune_eps = float(os.environ.get("PYFLOW_PRUNE_EPS", "1e-7"))
+    except Exception:
+        prune_eps = 1e-7
+    try:
+        active_radius = int(os.environ.get("PYFLOW_PRUNE_ACTIVE_RADIUS", "-1"))
+    except Exception:
+        active_radius = -1
+
+    # Precompute active sites (2D only) if requested.
+    active_site = None
+    if active_radius >= 0:
+        try:
+            Lside = int(round(float(n) ** 0.5))
+            if Lside * Lside == int(n) and Lside > 0:
+                cx, cy = Lside // 2, Lside // 2
+                act = np.zeros((n,), dtype=np.bool_)
+                for s in range(n):
+                    x, y = divmod(s, Lside)
+                    if (abs(x - cx) + abs(y - cy)) <= active_radius:
+                        act[s] = True
+                active_site = act
+        except Exception:
+            active_site = None
+
+    def _safe_mu_jax(x) -> float:
+        try:
+            mu = float(jnp.max(jnp.abs(x)))
+        except Exception:
+            mu = float("nan")
+        if (not np.isfinite(mu)) or mu <= 0.0:
+            return 1.0
+        return mu
+
+    # Preallocate factor lists (filled up to k)
+    T = len(dl_list)
+    h2_U: list[np.ndarray | None] = [None] * T
+    h2_S: list[np.ndarray | None] = [None] * T
+    h2_Vt: list[np.ndarray | None] = [None] * T
+    h2_rows: list[np.ndarray | None] = [None] * T
+    h2_cols: list[np.ndarray | None] = [None] * T
+    h4_U: list[np.ndarray | None] = [None] * T
+    h4_S: list[np.ndarray | None] = [None] * T
+    h4_Vt: list[np.ndarray | None] = [None] * T
+    h4_rows: list[np.ndarray | None] = [None] * T
+    h4_cols: list[np.ndarray | None] = [None] * T
+    scale_h2 = np.ones((T,), dtype=np.float32)
+    scale_h4 = np.ones((T,), dtype=np.float32)
+
+    def _coo_subblock_svd_2d(A: np.ndarray, th: float, rank: int):
+        """COO support -> (rows, cols, U,S,Vt) for a dense sub-block of A."""
+        nrow, ncol = A.shape
+        flat = A.reshape(-1)
+        if th <= 0.0:
+            th = 0.0
+        idx = np.flatnonzero(np.abs(flat) >= th).astype(np.int32, copy=False)
+        if idx.size == 0:
+            rows = np.zeros((0,), dtype=np.int32)
+            cols = np.zeros((0,), dtype=np.int32)
+            U = np.zeros((0, 0), dtype=np.float32)
+            S = np.zeros((0,), dtype=np.float32)
+            Vt = np.zeros((0, 0), dtype=np.float32)
+            return rows, cols, U, S, Vt
+        rr = (idx // ncol).astype(np.int32, copy=False)
+        cc = (idx - rr * ncol).astype(np.int32, copy=False)
+        if active_site is not None and idx.size:
+            keep = active_site[rr] | active_site[cc]
+            idx = idx[keep]
+            rr = rr[keep]
+            cc = cc[keep]
+            if idx.size == 0:
+                rows = np.zeros((0,), dtype=np.int32)
+                cols = np.zeros((0,), dtype=np.int32)
+                U = np.zeros((0, 0), dtype=np.float32)
+                S = np.zeros((0,), dtype=np.float32)
+                Vt = np.zeros((0, 0), dtype=np.float32)
+                return rows, cols, U, S, Vt
+        rows = np.unique(rr).astype(np.int32, copy=False)
+        cols = np.unique(cc).astype(np.int32, copy=False)
+        rmap = np.full((nrow,), -1, dtype=np.int32)
+        cmap = np.full((ncol,), -1, dtype=np.int32)
+        rmap[rows] = np.arange(rows.size, dtype=np.int32)
+        cmap[cols] = np.arange(cols.size, dtype=np.int32)
+        sub = np.zeros((rows.size, cols.size), dtype=np.float32)
+        sub[rmap[rr], cmap[cc]] = flat[idx].astype(np.float32, copy=False)
+        r_eff = int(min(rank, sub.shape[0], sub.shape[1]))
+        if r_eff <= 0:
+            r_eff = 1
+        U, S, Vt = hybrid_svd(sub, rank=r_eff, oversample=svd_oversample, n_iter=svd_niter)
+        return rows, cols, U, S, Vt
+
+    def _coo_subblock_svd_h4(A4: np.ndarray, th: float, rank: int):
+        """COO support (with optional active-site filtering) -> sub-block SVD for A4=(n^2,n^2)."""
+        n2 = A4.shape[0]
+        flat = A4.reshape(-1)
+        if th <= 0.0:
+            th = 0.0
+        idx = np.flatnonzero(np.abs(flat) >= th).astype(np.int32, copy=False)
+        if idx.size == 0:
+            rows = np.zeros((0,), dtype=np.int32)
+            cols = np.zeros((0,), dtype=np.int32)
+            U = np.zeros((0, 0), dtype=np.float32)
+            S = np.zeros((0,), dtype=np.float32)
+            Vt = np.zeros((0, 0), dtype=np.float32)
+            return rows, cols, U, S, Vt
+        rr = (idx // n2).astype(np.int32, copy=False)
+        cc = (idx - rr * n2).astype(np.int32, copy=False)
+        if active_site is not None and idx.size:
+            i0 = (rr // n).astype(np.int32, copy=False)
+            j0 = (rr - i0 * n).astype(np.int32, copy=False)
+            k0 = (cc // n).astype(np.int32, copy=False)
+            l0 = (cc - k0 * n).astype(np.int32, copy=False)
+            keep = active_site[i0] | active_site[j0] | active_site[k0] | active_site[l0]
+            idx = idx[keep]
+            rr = rr[keep]
+            cc = cc[keep]
+            if idx.size == 0:
+                rows = np.zeros((0,), dtype=np.int32)
+                cols = np.zeros((0,), dtype=np.int32)
+                U = np.zeros((0, 0), dtype=np.float32)
+                S = np.zeros((0,), dtype=np.float32)
+                Vt = np.zeros((0, 0), dtype=np.float32)
+                return rows, cols, U, S, Vt
+        rows = np.unique(rr).astype(np.int32, copy=False)
+        cols = np.unique(cc).astype(np.int32, copy=False)
+        rmap = np.full((n2,), -1, dtype=np.int32)
+        cmap = np.full((n2,), -1, dtype=np.int32)
+        rmap[rows] = np.arange(rows.size, dtype=np.int32)
+        cmap[cols] = np.arange(cols.size, dtype=np.int32)
+        sub = np.zeros((rows.size, cols.size), dtype=np.float32)
+        sub[rmap[rr], cmap[cc]] = flat[idx].astype(np.float32, copy=False)
+        r_eff = int(min(rank, sub.shape[0], sub.shape[1]))
+        if r_eff <= 0:
+            r_eff = 1
+        U, S, Vt = hybrid_svd(sub, rank=r_eff, oversample=svd_oversample, n_iter=svd_niter)
+        return rows, cols, U, S, Vt
+
+    def _compress_snapshot(idx: int, h2_jax, h4_jax) -> None:
+        mu2 = _safe_mu_jax(h2_jax) if exp_scale else 1.0
+        mu4 = _safe_mu_jax(h4_jax) if exp_scale else 1.0
+        scale_h2[idx] = np.float32(mu2)
+        scale_h4[idx] = np.float32(mu4)
+
+        h2_np = np.array((h2_jax / mu2) if exp_scale else h2_jax, dtype=np.float32)
+        h4_np = np.array((h4_jax / mu4) if exp_scale else h4_jax, dtype=np.float32)
+
+        if coo_enable:
+            th2 = (prune_eps / mu2) if exp_scale else prune_eps
+            th4 = (prune_eps / mu4) if exp_scale else prune_eps
+
+            rows2, cols2, U2, S2, Vt2 = _coo_subblock_svd_2d(h2_np.reshape((n, n)), th2, svd_rank_h2)
+            h2_rows[idx] = rows2
+            h2_cols[idx] = cols2
+            h2_U[idx] = U2.astype(svd_store_dtype, copy=False)
+            h2_S[idx] = S2
+            h2_Vt[idx] = Vt2.astype(svd_store_dtype, copy=False)
+
+            n2 = n * n
+            A4 = h4_np.reshape((n2, n2))
+            rows4, cols4, U4, S4, Vt4 = _coo_subblock_svd_h4(A4, th4, svd_rank_h4)
+            h4_rows[idx] = rows4
+            h4_cols[idx] = cols4
+            h4_U[idx] = U4.astype(svd_store_dtype, copy=False)
+            h4_S[idx] = S4
+            h4_Vt[idx] = Vt4.astype(svd_store_dtype, copy=False)
+            del A4
+        else:
+            U2, S2, Vt2 = hybrid_svd(h2_np.reshape((n, n)), rank=svd_rank_h2, oversample=svd_oversample, n_iter=svd_niter)
+            h2_rows[idx] = None
+            h2_cols[idx] = None
+            h2_U[idx] = U2.astype(svd_store_dtype, copy=False)
+            h2_S[idx] = S2
+            h2_Vt[idx] = Vt2.astype(svd_store_dtype, copy=False)
+
+            n2 = n * n
+            A4 = h4_np.reshape((n2, n2))
+            U4, S4, Vt4 = hybrid_svd(A4, rank=svd_rank_h4, oversample=svd_oversample, n_iter=svd_niter)
+            h4_rows[idx] = None
+            h4_cols[idx] = None
+            h4_U[idx] = U4.astype(svd_store_dtype, copy=False)
+            h4_S[idx] = S4
+            h4_Vt[idx] = Vt4.astype(svd_store_dtype, copy=False)
+            del A4
+
+        del h2_np, h4_np
+
+    def _load_snapshot(idx: int):
+        dense_dtype = np.float64 if dtype == jnp.float64 else np.float32
+
+        U2 = h2_U[idx]
+        S2 = h2_S[idx]
+        Vt2 = h2_Vt[idx]
+        r2 = h2_rows[idx]
+        c2 = h2_cols[idx]
+        if (U2 is None) or (S2 is None) or (Vt2 is None):
+            h2_dense = np.zeros((n, n), dtype=dense_dtype)
+        else:
+            if (r2 is None) or (c2 is None):
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False),
+                    S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n),
+                    out_dtype=dense_dtype,
+                )
+            else:
+                sub = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False),
+                    S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (int(r2.size), int(c2.size)),
+                    out_dtype=np.float32,
+                ).astype(dense_dtype, copy=False)
+                h2_dense = np.zeros((n, n), dtype=dense_dtype)
+                if r2.size and c2.size:
+                    h2_dense[np.ix_(r2.astype(np.int64, copy=False), c2.astype(np.int64, copy=False))] = sub
+        if exp_scale:
+            h2_dense *= float(scale_h2[idx])
+
+        U4 = h4_U[idx]
+        S4 = h4_S[idx]
+        Vt4 = h4_Vt[idx]
+        r4 = h4_rows[idx]
+        c4 = h4_cols[idx]
+        if (U4 is None) or (S4 is None) or (Vt4 is None):
+            h4_dense = np.zeros((n, n, n, n), dtype=dense_dtype)
+        else:
+            n2 = n * n
+            if (r4 is None) or (c4 is None):
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False),
+                    S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2, n2),
+                    out_dtype=dense_dtype,
+                )
+            else:
+                sub = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False),
+                    S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (int(r4.size), int(c4.size)),
+                    out_dtype=np.float32,
+                ).astype(dense_dtype, copy=False)
+                h4_mat = np.zeros((n2, n2), dtype=dense_dtype)
+                if r4.size and c4.size:
+                    h4_mat[np.ix_(r4.astype(np.int64, copy=False), c4.astype(np.int64, copy=False))] = sub
+            h4_dense = h4_mat.reshape((n, n, n, n))
+        if exp_scale:
+            h4_dense *= float(scale_h4[idx])
+
+        return jnp.array(h2_dense, dtype=dtype), jnp.array(h4_dense, dtype=dtype)
+
+    print(
+        f"        [Hybrid-Original] Hybrid-SVD ON: rank_h2={svd_rank_h2} rank_h4={svd_rank_h4} "
+        f"oversample={svd_oversample} niter={svd_niter} store_dtype={svd_store_dtype.__name__} "
+        f"exp_scale={bool(exp_scale)} coo={bool(coo_enable)} eps={prune_eps:.0e} actR={active_radius}",
+        flush=True,
+    )
+    print(f"        [Hybrid-Original] Flow integration: max_steps={len(dl_list)}, cutoff={cutoff:.2e}, rtol={_rtol:.0e}, atol={_atol:.0e}", flush=True)
+
+    # Forward flow (store compressed snapshots)
+    k = 1
+    J0 = 1.0
+    last_h2 = H2_init
+    last_h4 = Hint_init
+    _compress_snapshot(0, last_h2, last_h4)
+    memlog("flow:alloc", step=0, mode="hybrid_original", kind="svd_factors", steps=len(dl_list), n=n)
+    last_progress = 0
+    approx = _approx_enabled()
+    _approx_cache: dict = {}
+
+    while k < len(dl_list) and ((forced is not None) or (J0 > cutoff)):
+        if approx and (not norm):
+            h2_next, h4_next = _approx_step_h2_h4(
+                last_h2,
+                last_h4,
+                float(dl_list[k - 1]),
+                float(dl_list[k]),
+                step_idx=k,
+                method=method,
+                cache=_approx_cache,
+                norm=norm,
+                Hflow=True,
+            )
+        else:
+            steps = np.linspace(dl_list[k - 1], dl_list[k], num=increment, endpoint=True)
+            soln = ode(int_ode, [last_h2, last_h4], steps, rtol=_rtol, atol=_atol)
+            h2_next, h4_next = soln[0][-1], soln[1][-1]
+
+        last_h2, last_h4 = h2_next, h4_next
+        _compress_snapshot(k, last_h2, last_h4)
+        J0 = float(jnp.max(jnp.abs(last_h2 - jnp.diag(jnp.diag(last_h2)))))
+
+        progress = (k * 100) // len(dl_list)
+        if progress >= last_progress + 10 or (k % 50 == 0):
+            print(f"        Step {k}/{len(dl_list)} ({progress}%) | l={dl_list[k]:.4f} | off-diag={J0:.2e}", flush=True)
+            last_progress = progress
+        if k % 10 == 0:
+            memlog("flow:step", step=k, mode="hybrid_original")
+        k += 1
+
+    print(f"        Converged at step {k-1}, final off-diag={J0:.2e}", flush=True)
+
+    # Truncate to actual trajectory length
+    if k != len(dl_list):
+        dl_list = dl_list[0:k]
+    T_eff = len(dl_list)
+    dl_list_fwd = np.array(dl_list)
+
+    # Final diagonal H from last computed state (do not force decompression)
+    H0_diag = last_h2.reshape(n, n)
+    Hint2 = last_h4.reshape(n, n, n, n)
+
+    # Extract density-density terms
+    HFint = jnp.zeros(n**2).reshape(n, n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i, j].set(Hint2[i, i, j, j] - Hint2[i, j, j, i])
+
+    # Invariant
+    delta = jnp.max(Hint_init)
+    e1 = jnp.trace(jnp.dot(H2_init, H2_init))
+    Hflat = HFint.reshape(n**2)
+    inv = 2 * jnp.sum(Hflat**2)
+    e2 = jnp.trace(jnp.dot(H0_diag, H0_diag))
+    inv2 = jnp.abs(e1 - e2 + ((2 * delta) ** 2) * (n - 1) - inv) / jnp.abs(e2 + ((2 * delta) ** 2) * (n - 1))
+
+    # l-bit interactions
+    lbits = jnp.zeros(n - 1)
+    for q in range(1, n):
+        lbits = lbits.at[q - 1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.0)))
+
+    # Forward LIOM integration (decompress on-the-fly)
+    jit_update = jit(update)
+    init_liom2 = jnp.zeros((n, n))
+    init_liom4 = jnp.zeros((n, n, n, n))
+    init_liom2 = init_liom2.at[n // 2, n // 2].set(1.0)
+    for k0 in range(T_eff - 1):
+        steps = np.linspace(dl_list_fwd[k0], dl_list_fwd[k0 + 1], num=increment, endpoint=True)
+        h2_now, h4_now = _load_snapshot(k0)
+        init_liom2, init_liom4 = jit_update(init_liom2, init_liom4, h2_now, h4_now, steps)
+    liom_fwd2 = np.array(init_liom2)
+    liom_fwd4 = np.array(init_liom4)
+
+    # Backward LIOM integration (decompress on-the-fly)
+    init_liom2 = jnp.zeros((n, n))
+    init_liom4 = jnp.zeros((n, n, n, n))
+    init_liom2 = init_liom2.at[n // 2, n // 2].set(1.0)
+    for idx in range(T_eff - 2, -1, -1):
+        steps = np.linspace(dl_list_fwd[idx + 1], dl_list_fwd[idx], num=increment, endpoint=True)
+        h2_now, h4_now = _load_snapshot(idx)
+        init_liom2, init_liom4 = jit_update(init_liom2, init_liom4, h2_now, h4_now, steps)
+
+    output = {
+        "H0_diag": np.array(H0_diag),
+        "Hint": np.array(Hint2),
+        "LIOM Interactions": np.array(lbits),
+        "LIOM2": np.array(init_liom2),
+        "LIOM4": np.array(init_liom4),
+        "LIOM2_FWD": liom_fwd2,
+        "LIOM4_FWD": liom_fwd4,
+        "Invariant": np.array(inv2),
+        "dl_list": dl_list_fwd,
+        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+
+    if store_flow:
+        # WARNING: this materializes the full dense trajectory; use only for debugging small systems.
+        flow2 = np.zeros((T_eff, n, n), dtype=np.float32)
+        flow4 = np.zeros((T_eff, n, n, n, n), dtype=np.float32)
+        for ii in range(T_eff):
+            h2_now, h4_now = _load_snapshot(ii)
+            flow2[ii] = np.array(h2_now, dtype=np.float32)
+            flow4[ii] = np.array(h4_now, dtype=np.float32)
+        output["flow2"] = flow2
+        output["flow4"] = flow4
+
+    return output
+
+
 #------------------------------------------------------------------------------
 # Optimized flow integration using JAX lax.while_loop
 #------------------------------------------------------------------------------
@@ -4750,6 +5200,11 @@ def hybrid_svd(A: np.ndarray, rank: int, oversample: int = 8, n_iter: int = 1, s
     # Use float32 for numerics unless the input is float64
     compute_dtype = np.float64 if A.dtype == np.float64 else np.float32
     Ac = A.astype(compute_dtype, copy=False)
+    # Robustness: sanitize non-finite values (can appear in aggressive fast modes / bad steps).
+    # Default ON; set PYFLOW_HYBRID_SVD_SANITIZE=0 to disable for debugging.
+    if os.environ.get("PYFLOW_HYBRID_SVD_SANITIZE", "1") not in ("0", "false", "False", "off", "OFF"):
+        if not np.all(np.isfinite(Ac)):
+            Ac = np.nan_to_num(Ac, nan=0.0, posinf=0.0, neginf=0.0)
 
     rng = np.random.default_rng(seed)
     Omega = rng.standard_normal(size=(n_, l)).astype(compute_dtype, copy=False)
@@ -4768,7 +5223,27 @@ def hybrid_svd(A: np.ndarray, rank: int, oversample: int = 8, n_iter: int = 1, s
 
     # Stage B: project then SVD on small matrix
     B = Q.T @ Ac  # (l, n)
-    Ub, S, Vt = np.linalg.svd(B, full_matrices=False)
+    # SVD can occasionally fail to converge (e.g. if non-finite sneaks in or LAPACK issues).
+    # Provide a stable fallback via symmetric eigendecomposition of (B B^T).
+    try:
+        Ub, S, Vt = np.linalg.svd(B, full_matrices=False)
+    except np.linalg.LinAlgError:
+        B2 = np.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
+        try:
+            Ub, S, Vt = np.linalg.svd(B2, full_matrices=False)
+        except np.linalg.LinAlgError:
+            # Fallback: eigen on small symmetric matrix
+            C = B2 @ B2.T  # (l, l)
+            w, Ue = np.linalg.eigh(C)
+            order = np.argsort(w)[::-1]
+            w = w[order]
+            Ub = Ue[:, order]
+            w = np.clip(w, 0.0, None)
+            S = np.sqrt(w)
+            # Recover Vt = (Ub^T B) / S with safe division
+            Vt = Ub.T @ B2
+            s_safe = np.where(S > 1e-12, S, 1.0)
+            Vt = Vt / s_safe.reshape((-1, 1))
     U = Q @ Ub  # (m, l)
 
     # Truncate
@@ -5131,10 +5606,9 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             else:
                 svd_store_dtype = np.float16
 
-            if svd_mode and prune:
-                # Avoid combining two independent compression schemes at once (keeps logic simple and predictable).
-                prune = False
-                print("        [Hybrid-SVD] NOTE: disabling PRUNE because HYBRID-SVD is enabled for this block.", flush=True)
+            # If both PRUNE and SVD are enabled, we run the full 3-stage pipeline:
+            #   DES (optional) -> COO support -> dense sub-block -> rSVD factors
+            coo_svd_mode = bool(svd_mode and prune)
 
             if svd_mode and (t_start_idx == 0) and (depth == 0):
                 print(
@@ -5167,6 +5641,18 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 h2_U: list[np.ndarray | None] = [None] * (block_len + 1)
                 h2_S: list[np.ndarray | None] = [None] * (block_len + 1)
                 h2_Vt: list[np.ndarray | None] = [None] * (block_len + 1)
+                h4_U: list[np.ndarray | None] = [None] * (block_len + 1)
+                h4_S: list[np.ndarray | None] = [None] * (block_len + 1)
+                h4_Vt: list[np.ndarray | None] = [None] * (block_len + 1)
+            elif coo_svd_mode:
+                # COO -> dense sub-block -> SVD factors (per snapshot)
+                h2_rows: list[np.ndarray | None] = [None] * (block_len + 1)
+                h2_cols: list[np.ndarray | None] = [None] * (block_len + 1)
+                h2_U: list[np.ndarray | None] = [None] * (block_len + 1)
+                h2_S: list[np.ndarray | None] = [None] * (block_len + 1)
+                h2_Vt: list[np.ndarray | None] = [None] * (block_len + 1)
+                h4_rows: list[np.ndarray | None] = [None] * (block_len + 1)
+                h4_cols: list[np.ndarray | None] = [None] * (block_len + 1)
                 h4_U: list[np.ndarray | None] = [None] * (block_len + 1)
                 h4_S: list[np.ndarray | None] = [None] * (block_len + 1)
                 h4_Vt: list[np.ndarray | None] = [None] * (block_len + 1)
@@ -5226,10 +5712,38 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     jj = (h2_idx - ii * n)
                     keep = active_site[ii] | active_site[jj]
                     h2_idx = h2_idx[keep]
-                h2_val = h2_flat[h2_idx].astype(buffer_dtype, copy=False) if h2_idx.size else np.zeros((0,), dtype=buffer_dtype)
-                h2_idx_chunks.append(h2_idx)
-                h2_val_chunks.append(h2_val)
-                h2_ptr.append(h2_ptr[-1] + int(h2_idx.size))
+                if coo_svd_mode:
+                    # COO support -> dense sub-block -> rSVD (H2)
+                    if h2_idx.size:
+                        ii = (h2_idx // n).astype(np.int32, copy=False)
+                        jj = (h2_idx - ii * n).astype(np.int32, copy=False)
+                        rows = np.unique(ii).astype(np.int32, copy=False)
+                        cols = np.unique(jj).astype(np.int32, copy=False)
+                        rmap = np.full((n,), -1, dtype=np.int32)
+                        cmap = np.full((n,), -1, dtype=np.int32)
+                        rmap[rows] = np.arange(rows.size, dtype=np.int32)
+                        cmap[cols] = np.arange(cols.size, dtype=np.int32)
+                        sub = np.zeros((rows.size, cols.size), dtype=np.float32)
+                        sub[rmap[ii], cmap[jj]] = h2_flat[h2_idx].astype(np.float32, copy=False)
+                    else:
+                        rows = np.zeros((0,), dtype=np.int32)
+                        cols = np.zeros((0,), dtype=np.int32)
+                        sub = np.zeros((0, 0), dtype=np.float32)
+                    r_eff = int(min(svd_rank_h2, sub.shape[0], sub.shape[1]))
+                    if r_eff <= 0:
+                        r_eff = 1
+                    U2, S2, Vt2 = hybrid_svd(sub, rank=r_eff, oversample=svd_oversample, n_iter=svd_niter)
+                    h2_rows[local_idx] = rows
+                    h2_cols[local_idx] = cols
+                    h2_U[local_idx] = U2.astype(svd_store_dtype, copy=False)
+                    h2_S[local_idx] = S2
+                    h2_Vt[local_idx] = Vt2.astype(svd_store_dtype, copy=False)
+                    del sub
+                else:
+                    h2_val = h2_flat[h2_idx].astype(buffer_dtype, copy=False) if h2_idx.size else np.zeros((0,), dtype=buffer_dtype)
+                    h2_idx_chunks.append(h2_idx)
+                    h2_val_chunks.append(h2_val)
+                    h2_ptr.append(h2_ptr[-1] + int(h2_idx.size))
 
                 # H4 sparse
                 h4_flat = h4_np.reshape(-1)
@@ -5246,10 +5760,39 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     l0 = (rem2 - k0 * n)
                     keep = active_site[i0] | active_site[j0] | active_site[k0] | active_site[l0]
                     h4_idx = h4_idx[keep]
-                h4_val = h4_flat[h4_idx].astype(buffer_dtype, copy=False) if h4_idx.size else np.zeros((0,), dtype=buffer_dtype)
-                hint_idx_chunks.append(h4_idx)
-                hint_val_chunks.append(h4_val)
-                hint_ptr.append(hint_ptr[-1] + int(h4_idx.size))
+                if coo_svd_mode:
+                    # COO support -> dense sub-block on (n^2,n^2) -> rSVD (H4)
+                    n2 = n * n
+                    if h4_idx.size:
+                        rr = (h4_idx // n2).astype(np.int32, copy=False)
+                        cc = (h4_idx - rr * n2).astype(np.int32, copy=False)
+                        rows = np.unique(rr).astype(np.int32, copy=False)
+                        cols = np.unique(cc).astype(np.int32, copy=False)
+                        rmap = np.full((n2,), -1, dtype=np.int32)
+                        cmap = np.full((n2,), -1, dtype=np.int32)
+                        rmap[rows] = np.arange(rows.size, dtype=np.int32)
+                        cmap[cols] = np.arange(cols.size, dtype=np.int32)
+                        sub = np.zeros((rows.size, cols.size), dtype=np.float32)
+                        sub[rmap[rr], cmap[cc]] = h4_flat[h4_idx].astype(np.float32, copy=False)
+                    else:
+                        rows = np.zeros((0,), dtype=np.int32)
+                        cols = np.zeros((0,), dtype=np.int32)
+                        sub = np.zeros((0, 0), dtype=np.float32)
+                    r_eff = int(min(svd_rank_h4, sub.shape[0], sub.shape[1]))
+                    if r_eff <= 0:
+                        r_eff = 1
+                    U4, S4, Vt4 = hybrid_svd(sub, rank=r_eff, oversample=svd_oversample, n_iter=svd_niter)
+                    h4_rows[local_idx] = rows
+                    h4_cols[local_idx] = cols
+                    h4_U[local_idx] = U4.astype(svd_store_dtype, copy=False)
+                    h4_S[local_idx] = S4
+                    h4_Vt[local_idx] = Vt4.astype(svd_store_dtype, copy=False)
+                    del sub
+                else:
+                    h4_val = h4_flat[h4_idx].astype(buffer_dtype, copy=False) if h4_idx.size else np.zeros((0,), dtype=buffer_dtype)
+                    hint_idx_chunks.append(h4_idx)
+                    hint_val_chunks.append(h4_val)
+                    hint_ptr.append(hint_ptr[-1] + int(h4_idx.size))
 
                 # Free temporary dense numpy arrays ASAP
                 del h2_np, h4_np, h2_flat, h4_flat, h2_mask, h4_mask
@@ -5369,7 +5912,7 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                         _append_sparse_snapshot(local_idx, curr_h2, curr_hint)
             
             # Finalize sparse buffers (concatenate) before backward sweep
-            if prune:
+            if prune and (not coo_svd_mode):
                 if h2_idx_chunks:
                     h2_idx = np.concatenate(h2_idx_chunks).astype(np.int32, copy=False)
                     h2_val = np.concatenate(h2_val_chunks).astype(buffer_dtype, copy=False)
@@ -5428,6 +5971,43 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                         if exp_scale:
                             h4_dense *= float(scale_hint[local_idx])
                         hint_now = jnp.array(h4_dense, dtype=dtype)
+                elif coo_svd_mode:
+                    dense_dtype = np.float64 if dtype == jnp.float64 else np.float32
+                    # H2 sub-block -> scatter
+                    r2 = h2_rows[local_idx] if 'h2_rows' in locals() else None
+                    c2 = h2_cols[local_idx] if 'h2_cols' in locals() else None
+                    U2 = h2_U[local_idx]
+                    S2 = h2_S[local_idx]
+                    Vt2 = h2_Vt[local_idx]
+                    if (U2 is None) or (S2 is None) or (Vt2 is None) or (r2 is None) or (c2 is None):
+                        h2_dense = np.zeros((n, n), dtype=dense_dtype)
+                    else:
+                        sub = hybrid_svd_decompress(U2.astype(np.float32, copy=False), S2, Vt2.astype(np.float32, copy=False), (int(r2.size), int(c2.size)), out_dtype=np.float32).astype(dense_dtype, copy=False)
+                        h2_dense = np.zeros((n, n), dtype=dense_dtype)
+                        if r2.size and c2.size:
+                            h2_dense[np.ix_(r2.astype(np.int64, copy=False), c2.astype(np.int64, copy=False))] = sub
+                    if exp_scale:
+                        h2_dense *= float(scale_h2[local_idx])
+                    h2_now = jnp.array(h2_dense, dtype=dtype)
+
+                    # H4 sub-block on (n^2,n^2) -> scatter
+                    r4 = h4_rows[local_idx] if 'h4_rows' in locals() else None
+                    c4 = h4_cols[local_idx] if 'h4_cols' in locals() else None
+                    U4 = h4_U[local_idx]
+                    S4 = h4_S[local_idx]
+                    Vt4 = h4_Vt[local_idx]
+                    n2 = n * n
+                    if (U4 is None) or (S4 is None) or (Vt4 is None) or (r4 is None) or (c4 is None):
+                        h4_dense = np.zeros((n, n, n, n), dtype=dense_dtype)
+                    else:
+                        sub = hybrid_svd_decompress(U4.astype(np.float32, copy=False), S4, Vt4.astype(np.float32, copy=False), (int(r4.size), int(c4.size)), out_dtype=np.float32).astype(dense_dtype, copy=False)
+                        h4_mat = np.zeros((n2, n2), dtype=dense_dtype)
+                        if r4.size and c4.size:
+                            h4_mat[np.ix_(r4.astype(np.int64, copy=False), c4.astype(np.int64, copy=False))] = sub
+                        h4_dense = h4_mat.reshape((n, n, n, n))
+                    if exp_scale:
+                        h4_dense *= float(scale_hint[local_idx])
+                    hint_now = jnp.array(h4_dense, dtype=dtype)
                 else:
                     # Materialize dense tensors on-the-fly from sparse COO in CPU RAM.
                     # Note: this keeps only sparse data resident across the block.
@@ -5466,7 +6046,10 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 else:
                     del h2_U, h2_S, h2_Vt, h4_U, h4_S, h4_Vt, scale_h2, scale_hint
             else:
-                del h2_idx, h2_val, hint_idx, hint_val, h2_ptr, hint_ptr, scale_h2, scale_hint
+                if coo_svd_mode:
+                    del h2_rows, h2_cols, h2_U, h2_S, h2_Vt, h4_rows, h4_cols, h4_U, h4_S, h4_Vt, scale_h2, scale_hint
+                else:
+                    del h2_idx, h2_val, hint_idx, hint_val, h2_ptr, hint_ptr, scale_h2, scale_hint
             gc.collect()
             
             return l2, l4

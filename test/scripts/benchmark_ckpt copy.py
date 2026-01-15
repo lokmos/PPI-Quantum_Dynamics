@@ -151,6 +151,9 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         use_ckpt_val = "recursive"
     elif mode == "hybrid":
         use_ckpt_val = "hybrid"
+    elif mode in ("hybrid-original", "hybrid_original"):
+        # Special: implemented only in the copy branch entrypoint (main_itc_cpu_d2 copy.py)
+        use_ckpt_val = "hybrid-original"
     elif mode == "adaptive":
         # adaptive grid runs on top of recursive checkpointing
         use_ckpt_val = "recursive"
@@ -197,6 +200,14 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
     if mode == "hybrid":
         # Hybrid in the copy branch is "progressive": includes dynamic exponent scaling (default on)
         # and Phase-2 sparsity pruning.
+        env.setdefault("PYFLOW_HYBRID_EXP_SCALE", "1")
+        env.setdefault("PYFLOW_HYBRID_PRUNE", "1")
+        env.setdefault("PYFLOW_PRUNE_EPS", "1e-7")
+    if mode in ("hybrid-original", "hybrid_original"):
+        # Hybrid-original (copy routines): DES + COO + (dense-subblock) rSVD compression
+        # NOTE: flow_static_int_hybrid_original always uses SVD; HYBRID_SVD is ignored there but
+        # we set it anyway for clarity/consistency with CLI usage.
+        env.setdefault("PYFLOW_HYBRID_SVD", "1")
         env.setdefault("PYFLOW_HYBRID_EXP_SCALE", "1")
         env.setdefault("PYFLOW_HYBRID_PRUNE", "1")
         env.setdefault("PYFLOW_PRUNE_EPS", "1e-7")
@@ -253,7 +264,7 @@ def run_single_benchmark(L: int, mode: str, dis_type: str, method: str, d: float
         return {"L": L, "mode": mode, "status": "error", "error": str(e)}
 
 def collect_all_results(L_min, L_max, d, p):
-    modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
+    modes = ["original", "ckpt", "recursive", "hybrid", "hybrid-original", "adaptive"]
     data = {} 
     dim = 2; order = 4; x = 0.0; delta = 0.1
     base_dir = TEST_DIR
@@ -277,7 +288,7 @@ def print_report(data, L_min, L_max):
     print("=" * 110)
     
     # Headers
-    headers = f"{'L':<4} {'n':<4} │ {'Original':>10} {'Linear':>10} {'Recursive':>10} {'Hybrid':>10} {'Adaptive':>10} │ {'Reduct(Rec)':>12} {'Reduct(Hyb)':>12} {'Reduct(Adp)':>12}"
+    headers = f"{'L':<4} {'n':<4} │ {'Original':>10} {'Linear':>10} {'Recursive':>10} {'Hybrid':>10} {'HybOrig':>10} {'Adaptive':>10} │ {'Reduct(Rec)':>12} {'Reduct(Hyb)':>12} {'Reduct(HO)':>12} {'Reduct(Adp)':>12}"
     print(headers)
     print("─" * 110)
 
@@ -296,12 +307,14 @@ def print_report(data, L_min, L_max):
         lin = get_val("ckpt")
         rec = get_val("recursive")
         hyb = get_val("hybrid")
+        hyb_orig = get_val("hybrid-original")
         adp = get_val("adaptive")
         
         s_orig = f"{orig:.0f}" if orig is not None else "-"
         s_lin = f"{lin:.0f}" if lin is not None else "-"
         s_rec = f"{rec:.0f}" if rec is not None else "-"
         s_hyb = f"{hyb:.0f}" if hyb is not None else "-"
+        s_ho = f"{hyb_orig:.0f}" if hyb_orig is not None else "-"
         s_adp = f"{adp:.0f}" if adp is not None else "-"
         
         # Calculate reductions relative to Original NET memory
@@ -313,9 +326,10 @@ def print_report(data, L_min, L_max):
 
         r_rec = calc_reduct(rec)
         r_hyb = calc_reduct(hyb)
+        r_ho = calc_reduct(hyb_orig)
         r_adp = calc_reduct(adp)
         
-        print(f"{L:<4} {n:<4} │ {s_orig:>10} {s_lin:>10} {s_rec:>10} {s_hyb:>10} {s_adp:>10} │ {r_rec:>12} {r_hyb:>12} {r_adp:>12}")
+        print(f"{L:<4} {n:<4} │ {s_orig:>10} {s_lin:>10} {s_rec:>10} {s_hyb:>10} {s_ho:>10} {s_adp:>10} │ {r_rec:>12} {r_hyb:>12} {r_ho:>12} {r_adp:>12}")
     print("─" * 110)
 
 def parse_plan(plan_str):
@@ -407,7 +421,7 @@ def main():
     else:
         L_min_arg = int(pos_args[0]) if len(pos_args) > 0 else 3
         L_max_arg = int(pos_args[1]) if len(pos_args) > 1 else 6
-        valid_modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
+        valid_modes = ["original", "ckpt", "recursive", "hybrid", "hybrid-original", "adaptive"]
         modes_to_run = valid_modes if mode_arg == "all" else [mode_arg]
         for m in modes_to_run:
             raw_tasks.append({"mode": m, "range": range(L_min_arg, L_max_arg + 1)})
@@ -420,7 +434,7 @@ def main():
         mode = t["mode"]
         for L in t["range"]:
             flat_tasks.append((L, mode))
-    mode_priority = {"original": 0, "ckpt": 1, "recursive": 2, "hybrid": 3, "adaptive": 4}
+    mode_priority = {"original": 0, "ckpt": 1, "recursive": 2, "hybrid": 3, "hybrid-original": 4, "adaptive": 5}
     flat_tasks.sort(key=lambda x: (x[0], mode_priority.get(x[1], 99)))
 
     # (Fast memory-profiling mode removed)
@@ -431,7 +445,7 @@ def main():
     run_base_dir.mkdir(parents=True, exist_ok=True)
 
     benchmark_start = time.time()
-    per_mode_elapsed_s: dict[str, float] = {"original": 0.0, "ckpt": 0.0, "recursive": 0.0, "hybrid": 0.0, "adaptive": 0.0}
+    per_mode_elapsed_s: dict[str, float] = {"original": 0.0, "ckpt": 0.0, "recursive": 0.0, "hybrid": 0.0, "hybrid-original": 0.0, "adaptive": 0.0}
 
     print("=" * 110)
     print(f"BENCHMARK EXECUTION PLAN (L-First, Net Memory Reporting)")
@@ -462,7 +476,7 @@ def main():
     # Reuse the same report logic but point at this run directory
     all_data = {}
     dim = 2; order = 4; x = 0.0; delta = 0.1
-    modes = ["original", "ckpt", "recursive", "hybrid", "adaptive"]
+    modes = ["original", "ckpt", "recursive", "hybrid", "hybrid-original", "adaptive"]
     for L in range(L_min_global, L_max_global + 1):
         all_data[L] = {}
         for mode in modes:
@@ -478,7 +492,7 @@ def main():
     total_wall = time.time() - benchmark_start
     print("\nTiming Summary (wall time):")
     print(f"  Total benchmark: {total_wall:.2f}s")
-    for m in ("original", "ckpt", "recursive", "hybrid", "adaptive"):
+    for m in ("original", "ckpt", "recursive", "hybrid", "hybrid-original", "adaptive"):
         if per_mode_elapsed_s.get(m, 0.0) > 0:
             print(f"  {m:<10}: {per_mode_elapsed_s[m]:.2f}s")
 

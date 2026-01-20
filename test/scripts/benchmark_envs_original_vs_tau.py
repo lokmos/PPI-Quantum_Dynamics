@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark (paper-oriented): Original vs Adaptive (on top of recursive checkpointing) across multiple physical
-environments (2D only).
+Benchmark (paper-oriented): Hybrid-Original vs Hybrid-SVD across multiple physical environments (2D only).
 
 Design goals:
 - Flow-equation / numerical settings are FIXED inside this script (paper reproducibility).
 - Physical environments (disorder/potential type + strength) are enumerated here.
-- Runs ORIGINAL and ADAPTIVE for each (env, L) pair with identical forced steps.
+- Runs HYBRID-ORIGINAL and HYBRID-SVD for each (env, L) pair with identical forced steps.
 - Produces net-memory numbers from memlog (peak RSS - baseline RSS) during the *flow phase only*.
-- Also captures [RECURSIVE_STATS] JSON from stdout for extra diagnostics (recomputed steps, etc.).
 
 Usage (one command):
   python test/scripts/benchmark_envs_original_vs_tau.py
@@ -36,15 +34,13 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CODE_DIR = REPO_ROOT / "code"
-MAIN = CODE_DIR / "main_itc_cpu_d2.py"
+MAIN = CODE_DIR / "main_itc_cpu_d2 copy.py"
 
 # -----------------------------------------------------------------------------
 # Fixed L ranges (paper-oriented)
 # -----------------------------------------------------------------------------
-# Original is more memory-hungry; cap at smaller L.
-ORIG_L_MIN, ORIG_L_MAX = 6, 8
-# Adaptive (on recursive) can scale further; extend L if desired.
-ADAPT_L_MIN, ADAPT_L_MAX = 5, 8
+# Keep conservative defaults; override via --L if desired.
+L_MIN_DEFAULT, L_MAX_DEFAULT = 6, 8
 
 
 # -----------------------------------------------------------------------------
@@ -90,6 +86,8 @@ class EnvCase:
 
 
 ENV_CASES: list[EnvCase] = [
+    # Benchmark default environment
+    EnvCase("random_d1", "random", 1.0),
     EnvCase("random_d4", "random", 4.0),
     EnvCase("qp_golden_d1", "QPgolden", 1.0),
     EnvCase("qp_golden_d4", "QPgolden", 4.0),
@@ -100,32 +98,24 @@ ENV_CASES: list[EnvCase] = [
 
 
 # -----------------------------------------------------------------------------
-# Adaptive configuration (runs on top of recursive checkpointing)
+# Hybrid configurations
 # -----------------------------------------------------------------------------
-ADAPTIVE_ENV: dict[str, str] = {
-    "USE_CKPT": "recursive",
-    # Split strategy is irrelevant to adaptive grid itself; keep it explicit to avoid inheriting
-    # shell/user env vars (e.g. a leftover "tau" split).
-    "PYFLOW_RECURSIVE_SPLIT": "uniform",
-    # Enable adaptive grid (controller). Since this script forces a fixed number of steps for
-    # reproducibility, explicitly allow adaptive grid even when PYFLOW_FORCE_STEPS is set.
-    "PYFLOW_ADAPTIVE_GRID": "1",
-    "PYFLOW_ADAPTIVE_METHOD": "controller",
-    "PYFLOW_ADAPTIVE_ALLOW_FORCE": "1",
-    # Defaults tuned for benchmarking; override by exporting these env vars if needed.
-    "PYFLOW_ADAPTIVE_TARGET": "1e-2",
-    "PYFLOW_ADAPTIVE_INCLUDE_H4": "0",
-    "PYFLOW_ADAPTIVE_W4": "1.0",
-    "PYFLOW_ADAPTIVE_MIN_DL": "1e-8",
-    "PYFLOW_ADAPTIVE_MAX_DL": "1e2",
-    "PYFLOW_ADAPTIVE_MAX_STEPS": "20000",
-    "PYFLOW_ADAPTIVE_LOG_EVERY": "200",
-    # Helpful: print stats JSON
-    "PYFLOW_RECURSIVE_STATS": "1",
+HYBRID_ORIGINAL_ENV: dict[str, str] = {
+    # Implemented in copy routines (explicit dispatch in main_itc_cpu_d2 copy.py)
+    "USE_CKPT": "hybrid-original",
+    # Keep explicit for reproducibility (defaults are the same).
+    "PYFLOW_HYBRID_EXP_SCALE": "1",
+    "PYFLOW_HYBRID_PRUNE": "0",
 }
 
-ORIG_ENV: dict[str, str] = {
-    "USE_CKPT": "0",
+HYBRID_SVD_ENV: dict[str, str] = {
+    "USE_CKPT": "hybrid",
+    # Enable Hybrid-SVD / rSVD compression path inside hybrid checkpointing.
+    "PYFLOW_HYBRID_SVD": "1",
+    "PYFLOW_HYBRID_COMPRESS": "hybrid-svd",
+    # Keep explicit for reproducibility (defaults are the same).
+    "PYFLOW_HYBRID_EXP_SCALE": "1",
+    "PYFLOW_HYBRID_PRUNE": "0",
 }
 
 
@@ -182,7 +172,7 @@ def run_case(
     base_env: dict[str, str],
 ) -> dict[str, Any]:
     """Run a single (env, L, mode) benchmark and return stats dict."""
-    assert mode in ("original", "adaptive")
+    assert mode in ("hybrid-original", "hybrid-svd")
     n = L * L
     out_dir = run_dir / env_case.key / mode
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -196,10 +186,10 @@ def run_case(
     if env_case.extra_env:
         env.update(env_case.extra_env)
 
-    if mode == "original":
-        env.update(ORIG_ENV)
+    if mode == "hybrid-original":
+        env.update(HYBRID_ORIGINAL_ENV)
     else:
-        env.update(ADAPTIVE_ENV)
+        env.update(HYBRID_SVD_ENV)
 
     cmd = [
         sys.executable,
@@ -265,7 +255,7 @@ def print_table(
         by_env.setdefault(r["env"], {}).setdefault(int(r["L"]), {})[r["mode"]] = r
 
     print("\n" + "=" * 120)
-    print("BENCHMARK (2D spinless fermion): Original vs Adaptive (on recursive)")
+    print("BENCHMARK (2D spinless fermion): Hybrid-Original vs Hybrid-SVD")
     print(
         f"Settings: method={FIXED_METHOD} cutoff={cutoff} ode_tol={ode_tol} steps={force_steps} memlog_every={memlog_every}"
     )
@@ -273,35 +263,31 @@ def print_table(
 
     for env_key in env_keys:
         print(f"\n### 环境: {env_key}")
-        hdr = f"{'L':<4} {'n':<5} │ {'Original(NetMB)':>14} {'Adaptive(NetMB)':>16} │ {'内存下降':>8} {'重算步数':>10}"
+        hdr = f"{'L':<4} {'n':<5} │ {'HybOrig(NetMB)':>14} {'HybSVD(NetMB)':>14} │ {'内存下降':>8}"
         print(hdr)
-        print("─" * 90)
+        print("─" * 78)
         for L in range(L_min, L_max + 1):
             row = by_env.get(env_key, {}).get(L, {})
-            orig = row.get("original")
-            adp = row.get("adaptive")
+            hyb_orig = row.get("hybrid-original")
+            hyb_svd = row.get("hybrid-svd")
 
             def _fmt_mb(x):
                 if not x or x.get("status") != "ok" or "rss_net_mb" not in x:
                     return "-"
                 return f"{float(x['rss_net_mb']):.1f}"
 
-            o_mb = _fmt_mb(orig)
-            a_mb = _fmt_mb(adp)
+            o_mb = _fmt_mb(hyb_orig)
+            s_mb = _fmt_mb(hyb_svd)
 
             reduct = "-"
-            if orig and adp and orig.get("status") == "ok" and adp.get("status") == "ok":
-                o = float(orig.get("rss_net_mb", 0.0))
-                a = float(adp.get("rss_net_mb", 0.0))
+            if hyb_orig and hyb_svd and hyb_orig.get("status") == "ok" and hyb_svd.get("status") == "ok":
+                o = float(hyb_orig.get("rss_net_mb", 0.0))
+                s = float(hyb_svd.get("rss_net_mb", 0.0))
                 if o > 1e-6:
-                    reduct = f"{(1.0 - a / o) * 100.0:+.0f}%"
+                    reduct = f"{(1.0 - s / o) * 100.0:+.0f}%"
 
-            recompute = "-"
-            if adp and adp.get("recursive_stats"):
-                recompute = str(adp["recursive_stats"].get("recomputed_steps", "-"))
-
-            print(f"{L:<4} {L*L:<5} │ {o_mb:>14} {a_mb:>16} │ {reduct:>8} {recompute:>10}")
-        print("─" * 90)
+            print(f"{L:<4} {L*L:<5} │ {o_mb:>14} {s_mb:>14} │ {reduct:>8}")
+        print("─" * 78)
 
 
 def main() -> None:
@@ -311,7 +297,7 @@ def main() -> None:
         nargs=2,
         type=int,
         default=None,
-        help="Override L range for BOTH modes: L_min L_max (inclusive). If omitted, use paper defaults (orig 2..8, adaptive 2..8).",
+        help=f"Override L range (inclusive): L_min L_max. If omitted, use defaults {L_MIN_DEFAULT}..{L_MAX_DEFAULT}.",
     )
     ap.add_argument("--only-env", nargs="*", default=None, help="Subset of env keys to run (space-separated)")
     ap.add_argument("--no-jit", action="store_true", help="Disable USE_JIT_FLOW (avoid compile overhead)")
@@ -338,14 +324,10 @@ def main() -> None:
 
     # For printing tables (cover full union of L across modes)
     if args.L is None:
-        orig_L_min, orig_L_max = ORIG_L_MIN, ORIG_L_MAX
-        adapt_L_min, adapt_L_max = ADAPT_L_MIN, ADAPT_L_MAX
+        L_min, L_max = L_MIN_DEFAULT, L_MAX_DEFAULT
     else:
-        orig_L_min, orig_L_max = int(args.L[0]), int(args.L[1])
-        adapt_L_min, adapt_L_max = orig_L_min, orig_L_max
-
-    L_min_all = min(orig_L_min, adapt_L_min)
-    L_max_all = max(orig_L_max, adapt_L_max)
+        L_min, L_max = int(args.L[0]), int(args.L[1])
+    L_min_all, L_max_all = L_min, L_max
     use_jit = not bool(args.no_jit)
 
     env_cases = ENV_CASES
@@ -362,17 +344,10 @@ def main() -> None:
 
     print("=" * 120)
     print("BENCHMARK PLAN")
-    print(f"- L range (original): {orig_L_min}..{orig_L_max}")
-    print(f"- L range (adaptive): {adapt_L_min}..{adapt_L_max}")
-    if args.L is None:
-        print(
-            f"- Schedule: for each L={orig_L_min}..{orig_L_max}, run ALL envs: original then adaptive; "
-            f"after ALL L done, run adaptive-only for L={max(adapt_L_min, orig_L_max + 1)}..{adapt_L_max}"
-        )
-    else:
-        print(f"- Schedule: for each L={orig_L_min}..{orig_L_max}, run ALL envs: original then adaptive")
+    print(f"- L range: {L_min}..{L_max}")
+    print(f"- Schedule: for each L={L_min}..{L_max}, run ALL envs: hybrid-original then hybrid-svd")
     print(f"- Envs: {[e.key for e in env_cases]}")
-    print(f"- Modes: ['original', 'adaptive']")
+    print(f"- Modes: ['hybrid-original', 'hybrid-svd']")
     print(f"- Run dir: {run_dir}")
     print(f"- USE_JIT_FLOW: {'ON' if use_jit else 'OFF'}")
     print(f"- cutoff: {cutoff} | ode_tol: {ode_tol} | force_steps: {FIXED_FORCE_STEPS} | memlog_every: {FIXED_MEMLOG_EVERY}")
@@ -380,12 +355,11 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     t0 = time.time()
-    # Phase 1: for each L within original-range; run ALL envs: original then adaptive
-    for L in range(orig_L_min, orig_L_max + 1):
+    for L in range(L_min, L_max + 1):
         for env_case in env_cases:
-            # original
-            print(f"\n[RUN] env={env_case.key} L={L} mode=original ...", flush=True)
-            r = run_case(L, env_case, "original", use_jit, run_dir, base_env)
+            # hybrid-original
+            print(f"\n[RUN] env={env_case.key} L={L} mode=hybrid-original ...", flush=True)
+            r = run_case(L, env_case, "hybrid-original", use_jit, run_dir, base_env)
             results.append(r)
             if r.get("status") != "ok":
                 print("  [FAILED]")
@@ -395,34 +369,17 @@ def main() -> None:
                     f"  [OK] net={r.get('rss_net_mb', float('nan')):.1f}MB peak={r.get('rss_peak_mb', float('nan')):.1f}MB elapsed={r.get('elapsed_s', 0.0):.1f}s"
                 )
 
-            # adaptive for the same L (only if within adaptive range)
-            if adapt_L_min <= L <= adapt_L_max:
-                print(f"\n[RUN] env={env_case.key} L={L} mode=adaptive ...", flush=True)
-                r = run_case(L, env_case, "adaptive", use_jit, run_dir, base_env)
-                results.append(r)
-                if r.get("status") != "ok":
-                    print("  [FAILED]")
-                    print(r.get("stderr_tail", "(no stderr)"))
-                else:
-                    print(
-                        f"  [OK] net={r.get('rss_net_mb', float('nan')):.1f}MB peak={r.get('rss_peak_mb', float('nan')):.1f}MB elapsed={r.get('elapsed_s', 0.0):.1f}s"
-                    )
-
-    # Phase 2: after ALL envs finish phase 1, run adaptive-only for L beyond original max (e.g., 9..10)
-    adapt_only_start = max(adapt_L_min, orig_L_max + 1)
-    if adapt_only_start <= adapt_L_max:
-        for L in range(adapt_only_start, adapt_L_max + 1):
-            for env_case in env_cases:
-                print(f"\n[RUN] env={env_case.key} L={L} mode=adaptive ...", flush=True)
-                r = run_case(L, env_case, "adaptive", use_jit, run_dir, base_env)
-                results.append(r)
-                if r.get("status") != "ok":
-                    print("  [FAILED]")
-                    print(r.get("stderr_tail", "(no stderr)"))
-                else:
-                    print(
-                        f"  [OK] net={r.get('rss_net_mb', float('nan')):.1f}MB peak={r.get('rss_peak_mb', float('nan')):.1f}MB elapsed={r.get('elapsed_s', 0.0):.1f}s"
-                    )
+            # hybrid-svd
+            print(f"\n[RUN] env={env_case.key} L={L} mode=hybrid-svd ...", flush=True)
+            r = run_case(L, env_case, "hybrid-svd", use_jit, run_dir, base_env)
+            results.append(r)
+            if r.get("status") != "ok":
+                print("  [FAILED]")
+                print(r.get("stderr_tail", "(no stderr)"))
+            else:
+                print(
+                    f"  [OK] net={r.get('rss_net_mb', float('nan')):.1f}MB peak={r.get('rss_peak_mb', float('nan')):.1f}MB elapsed={r.get('elapsed_s', 0.0):.1f}s"
+                )
 
     # Save JSON
     out_json = run_dir / "results.json"

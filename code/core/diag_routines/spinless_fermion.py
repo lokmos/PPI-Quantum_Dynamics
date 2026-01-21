@@ -50,7 +50,14 @@ _NCORES = str(_safe_num_cores())
 os.environ.setdefault('OMP_NUM_THREADS', _NCORES)       # Set number of OpenMP threads to run in parallel
 os.environ.setdefault('MKL_NUM_THREADS', _NCORES)       # Set number of MKL threads to run in parallel
 os.environ.setdefault('NUMBA_NUM_THREADS', _NCORES)     # Set number of Numba threads
-os.environ['JAX_ENABLE_X64'] = 'false'  
+#
+# Precision control (must happen BEFORE importing jax):
+# - Default behavior remains float32 unless the user opts in.
+# - Opt-in knobs:
+#   - PYFLOW_ENABLE_X64=1 (preferred)
+#   - or set JAX_ENABLE_X64=true externally.
+_use_x64 = os.environ.get("PYFLOW_ENABLE_X64", "0") in ("1", "true", "True", "on", "ON", "yes", "YES")
+os.environ.setdefault("JAX_ENABLE_X64", "true" if _use_x64 else "false")
 import jax
 import jax.numpy as jnp
 from jax import jit

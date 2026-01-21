@@ -132,6 +132,15 @@ order = 4                       # Order of terms to keep in running Hamiltonian 
 # List of disorder strengths
 lmax =  1000                     # Flow time max
 qmax =  1000                     # Max number of flow time steps
+# Allow overriding the flow-time horizon / step budget from the environment.
+try:
+    lmax = float(os.environ.get("PYFLOW_LMAX", str(lmax)))
+except Exception:
+    pass
+try:
+    qmax = int(os.environ.get("PYFLOW_QMAX", str(qmax)))
+except Exception:
+    pass
 #if dim == 2:
 #    lmax *= 2
 #    qmax *= 1.5

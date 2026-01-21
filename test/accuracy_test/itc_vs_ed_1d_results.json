@@ -5,38 +5,38 @@
     "params": {
       "dis": "random",
       "d": 1.0,
-      "reps": 2,
+      "reps": 8,
       "p0": 0,
       "method": "tensordot"
     },
     "meta": {
       "original": {
-        "x_best_mean": 0.46,
-        "x_best_std": 0.46
+        "x_best_mean": 0.7224999999999999,
+        "x_best_std": 0.3023553373102582
       },
-      "hybrid": {
-        "x_best_mean": 0.385,
-        "x_best_std": 0.385
+      "hybrid-svd": {
+        "x_best_mean": 0.4675,
+        "x_best_std": 0.3896071739585913
       }
     },
     "errors": {
       "original_vs_ed": {
         "n_total": 151,
         "n_finite": 151,
-        "rmse": 0.2585735884360601,
-        "max_abs": 0.7859305750974178,
-        "mean_rel": 2.364631258567029,
-        "max_rel": 46.24837258725354
+        "rmse": 0.146955035889049,
+        "max_abs": 0.4791266215640818,
+        "mean_rel": 1.977663956735234,
+        "max_rel": 146.7257888897893
       },
-      "hybrid_vs_ed": {
+      "hybrid_svd_vs_ed": {
         "n_total": 151,
         "n_finite": 151,
-        "rmse": 0.26861573595200705,
-        "max_abs": 0.7547294718791704,
-        "mean_rel": 1.2908618834961199,
-        "max_rel": 30.684519954240496
+        "rmse": 0.16162522608493363,
+        "max_abs": 0.5018416449595804,
+        "mean_rel": 5.100796613232113,
+        "max_rel": 555.9078140605537
       }
     },
-    "plot": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/accuracy_test/itc_vs_ed_1d_L4_d1.00_reps2.png"
+    "plot": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/accuracy_test/itc_vs_ed_1d_L4_d1.00_reps8.png"
   }
 }

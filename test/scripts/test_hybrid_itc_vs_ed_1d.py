@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-1D ITC vs ED comparison for Original vs Hybrid.
+1D ITC vs ED comparison for Original vs Hybrid-SVD (full hybrid implementation).
 
 Why 1D:
 - The published notebook (`figures.ipynb`) compares ED to FE mainly in 1D.
 - 2D ITC can be noisier and the pipeline is less validated.
 
 What this script does:
-- Runs `code/main_itc_cpu.py` for original and hybrid modes
+- Runs `code/main_itc_cpu.py` for original and hybrid-svd modes
 - Uses hybrid cutoff=1e-6
 - Extracts `itc`, `itc_nonint`, and `ed_itc` from the output HDF5
 - Applies the same preprocessing conventions used in `code/proc.py` / `figures.ipynb`
@@ -54,11 +54,41 @@ class ModeSpec:
     name: str
     use_ckpt: str
     cutoff: str
+    extra_env: dict[str, str] | None = None
 
 
 MODES = [
-    ModeSpec("original", "0", ORIGINAL_CUTOFF),
-    ModeSpec("hybrid", "hybrid", HYBRID_CUTOFF),
+    ModeSpec(
+        "original",
+        "0",
+        ORIGINAL_CUTOFF,
+        extra_env={
+            # Be explicit: avoid inheriting any hybrid flags from the shell.
+            "PYFLOW_USE_COPY_ROUTINES": "0",
+            "PYFLOW_HYBRID_SVD": "0",
+            "PYFLOW_HYBRID_COMPRESS": "",
+            # Ensure ED is enabled for the baseline run.
+            "PYFLOW_SKIP_ED": "0",
+        },
+    ),
+    ModeSpec(
+        "hybrid-svd",
+        "hybrid",
+        HYBRID_CUTOFF,
+        extra_env={
+            # Use the "complete" hybrid implementation from spinless_fermion copy.py
+            "PYFLOW_USE_COPY_ROUTINES": "1",
+            # Enable projection-based compression path (Hybrid-SVD / rSVD)
+            "PYFLOW_HYBRID_SVD": "1",
+            "PYFLOW_HYBRID_COMPRESS": "hybrid-svd",
+            # Keep explicit for reproducibility (defaults are the same).
+            "PYFLOW_HYBRID_EXP_SCALE": "1",
+            "PYFLOW_HYBRID_PRUNE": "0",
+            # Critical speedup: ED is identical across modes for the same disorder (p),
+            # so we compute ED only once in the original run and reuse it for hybrid preprocessing.
+            "PYFLOW_SKIP_ED": "1",
+        },
+    ),
 ]
 
 
@@ -127,6 +157,11 @@ def run_case(L: int, mode: ModeSpec, dis_type: str, method: str, d: float, p: in
     env.update(BASE_ENV)
     env["USE_CKPT"] = mode.use_ckpt
     env["PYFLOW_CUTOFF"] = mode.cutoff
+    if mode.extra_env:
+        env.update(mode.extra_env)
+    # Allow callers to "unset" a var by passing an empty string.
+    if env.get("PYFLOW_FORCE_STEPS", "").strip() == "":
+        env.pop("PYFLOW_FORCE_STEPS", None)
 
     cmd = [sys.executable, str(CODE_DIR / "main_itc_cpu.py"), str(L), dis_type, method, str(d), str(p)]
     print(f"    Run p={p:3d} mode={mode.name:8s} cutoff={mode.cutoff} ...", end="", flush=True)
@@ -148,11 +183,9 @@ def read_itc_bundle(h5_path: Path) -> dict:
     with h5py.File(h5_path, "r") as hf:
         if "itc" not in hf:
             raise KeyError("Missing dataset `itc` in H5.")
-        if "ed_itc" not in hf:
-            raise KeyError("Missing dataset `ed_itc` in H5 (ED may be disabled or n too large).")
         itc = np.array(hf["itc"][:])
         itc_nonint = np.array(hf["itc_nonint"][:]) if "itc_nonint" in hf else None
-        ed_itc = np.array(hf["ed_itc"][:])
+        ed_itc = np.array(hf["ed_itc"][:]) if "ed_itc" in hf else None
         return {"itc": itc, "itc_nonint": itc_nonint, "ed_itc": ed_itc}
 
 
@@ -256,7 +289,38 @@ def main() -> None:
     ap.add_argument("--method", type=str, default=DEFAULT_METHOD)
     ap.add_argument("--d", type=float, default=DEFAULT_D)
     ap.add_argument("--p0", type=int, default=DEFAULT_P0)
+    ap.add_argument("--tol", type=str, default=ODE_TOL, help="ODE tol (rtol=atol). Smaller => more accurate, slower.")
+    ap.add_argument("--cutoff-original", type=str, default=ORIGINAL_CUTOFF, help="Truncation cutoff for original.")
+    ap.add_argument("--cutoff-hybrid", type=str, default=HYBRID_CUTOFF, help="Truncation cutoff for hybrid-svd.")
+    ap.add_argument(
+        "--x64",
+        action="store_true",
+        help="Enable float64 in JAX via PYFLOW_ENABLE_X64=1 (more accurate, slower).",
+    )
+    ap.add_argument("--svd-rank-h2", type=int, default=None, help="Hybrid-SVD rank for H2 snapshots.")
+    ap.add_argument("--svd-rank-h4", type=int, default=None, help="Hybrid-SVD rank for H4 snapshots (on n^2×n^2 reshape).")
+    ap.add_argument(
+        "--svd-store-dtype",
+        type=str,
+        default=None,
+        choices=["float16", "float32"],
+        help="Hybrid-SVD stored factor dtype (float32 improves accuracy, costs memory).",
+    )
+    ap.add_argument("--svd-niter", type=int, default=None, help="Hybrid-SVD power iterations (more accurate, slower).")
+    ap.add_argument("--svd-oversample", type=int, default=None, help="Hybrid-SVD oversampling (more accurate, slower).")
+    ap.add_argument(
+        "--force-steps",
+        type=int,
+        default=None,
+        help="Force exactly N flow steps via PYFLOW_FORCE_STEPS (speeds up runs; changes physics).",
+    )
     args = ap.parse_args()
+
+    # Apply runtime knobs to the base env used for ALL runs.
+    BASE_ENV["PYFLOW_ODE_RTOL"] = str(args.tol)
+    BASE_ENV["PYFLOW_ODE_ATOL"] = str(args.tol)
+    if args.x64:
+        BASE_ENV["PYFLOW_ENABLE_X64"] = "1"
 
     L_min = args.L_min
     L_max = args.L_max if args.L_max is not None else L_min
@@ -274,31 +338,83 @@ def main() -> None:
         per_mode_curves = {}
         per_mode_meta = {}
 
-        for mode in MODES:
-            itc_acc = []
-            ed_acc = []
-            x_best_list = []
-            for p in range(args.p0, args.p0 + args.reps):
-                run_case(L, mode, args.dis, args.method, args.d, p)
-                h5p = h5_path_for_1d(L, args.dis, args.d, p)
-                if not h5p.exists():
-                    raise FileNotFoundError(f"Expected output not found: {h5p}")
-                data = read_itc_bundle(h5p)
-                pre = preprocess_like_proc(data["itc"], data["itc_nonint"], data["ed_itc"])
-                itc_acc.append(pre["itc"])
-                ed_acc.append(pre["ed_itc"])
-                x_best_list.append(pre["x_best"])
+        # Speed plan:
+        # For each p, run original first (computes ED), then run hybrid-svd with ED skipped and reuse ED from original.
+        itc_acc: dict[str, list[np.ndarray]] = {m.name: [] for m in MODES}
+        ed_acc: list[np.ndarray] = []
+        x_best_list: dict[str, list[float]] = {m.name: [] for m in MODES}
 
-            itc_mean = np.mean(np.stack(itc_acc, axis=0), axis=0)
-            ed_mean = np.mean(np.stack(ed_acc, axis=0), axis=0)
-            per_mode_curves[mode.name] = {"itc": itc_mean, "ed": ed_mean}
-            per_mode_meta[mode.name] = {"x_best_mean": float(np.mean(x_best_list)), "x_best_std": float(np.std(x_best_list))}
+        # Local helper: per-run base env extras
+        def _extra_for_run(mode: ModeSpec) -> dict[str, str]:
+            extra = dict(mode.extra_env or {})
+            if args.force_steps is not None and args.force_steps > 0:
+                extra["PYFLOW_FORCE_STEPS"] = str(int(args.force_steps))
+            else:
+                # Ensure we don't inherit a forced-step run from the shell.
+                # (run_case will remove the key when value is empty)
+                extra["PYFLOW_FORCE_STEPS"] = ""
+            return extra
+
+        # Customize per-run mode configs based on CLI knobs
+        mode_by_name = {m.name: m for m in MODES}
+        _orig_base = mode_by_name["original"]
+        _hyb_base = mode_by_name["hybrid-svd"]
+
+        original_mode = ModeSpec(_orig_base.name, _orig_base.use_ckpt, str(args.cutoff_original), extra_env=_orig_base.extra_env)
+        # For hybrid we keep the default speed behavior (skip ED) but allow SVD knob overrides.
+        hyb_extra = dict(_hyb_base.extra_env or {})
+        if args.svd_rank_h2 is not None:
+            hyb_extra["PYFLOW_HYBRID_SVD_RANK_H2"] = str(int(args.svd_rank_h2))
+        if args.svd_rank_h4 is not None:
+            hyb_extra["PYFLOW_HYBRID_SVD_RANK_H4"] = str(int(args.svd_rank_h4))
+        if args.svd_store_dtype is not None:
+            hyb_extra["PYFLOW_HYBRID_SVD_STORE_DTYPE"] = str(args.svd_store_dtype)
+        if args.svd_niter is not None:
+            hyb_extra["PYFLOW_HYBRID_SVD_NITER"] = str(int(args.svd_niter))
+        if args.svd_oversample is not None:
+            hyb_extra["PYFLOW_HYBRID_SVD_OVERSAMPLE"] = str(int(args.svd_oversample))
+        hybrid_mode = ModeSpec(_hyb_base.name, _hyb_base.use_ckpt, str(args.cutoff_hybrid), extra_env=hyb_extra)
+
+        for p in range(args.p0, args.p0 + args.reps):
+            # original (with ED)
+            original_mode_p = ModeSpec(original_mode.name, original_mode.use_ckpt, original_mode.cutoff, extra_env=_extra_for_run(original_mode))
+            run_case(L, original_mode_p, args.dis, args.method, args.d, p)
+            h5p = h5_path_for_1d(L, args.dis, args.d, p)
+            if not h5p.exists():
+                raise FileNotFoundError(f"Expected output not found: {h5p}")
+            data_o = read_itc_bundle(h5p)
+            if data_o.get("ed_itc") is None:
+                raise KeyError("Missing dataset `ed_itc` in H5 (ED may be disabled or n too large).")
+            pre_o = preprocess_like_proc(data_o["itc"], data_o["itc_nonint"], data_o["ed_itc"])
+            itc_acc["original"].append(pre_o["itc"])
+            ed_acc.append(pre_o["ed_itc"])
+            x_best_list["original"].append(float(pre_o["x_best"]))
+
+            # hybrid-svd (skip ED, reuse ED from original)
+            hybrid_mode_p = ModeSpec(hybrid_mode.name, hybrid_mode.use_ckpt, hybrid_mode.cutoff, extra_env=_extra_for_run(hybrid_mode))
+            run_case(L, hybrid_mode_p, args.dis, args.method, args.d, p)
+            data_h = read_itc_bundle(h5p)  # same output path; overwritten by latest run for this p
+            pre_h = preprocess_like_proc(data_h["itc"], data_h["itc_nonint"], pre_o["ed_itc"])
+            itc_acc["hybrid-svd"].append(pre_h["itc"])
+            x_best_list["hybrid-svd"].append(float(pre_h["x_best"]))
+
+        # Aggregate
+        for mode in MODES:
+            itc_mean = np.mean(np.stack(itc_acc[mode.name], axis=0), axis=0)
+            per_mode_curves[mode.name] = {"itc": itc_mean}
+            per_mode_meta[mode.name] = {
+                "x_best_mean": float(np.mean(x_best_list[mode.name])),
+                "x_best_std": float(np.std(x_best_list[mode.name])),
+            }
+
+        ed_mean = np.mean(np.stack(ed_acc, axis=0), axis=0)
+        per_mode_curves["original"]["ed"] = ed_mean
 
         # Use ED from original for plotting (ED should match closely across modes, just noise)
         curves = {
             "ED (avg)": per_mode_curves["original"]["ed"],
             "Original (FE, avg)": per_mode_curves["original"]["itc"],
-            "Hybrid (FE, avg)": per_mode_curves["hybrid"]["itc"],
+            "Hybrid-SVD (FE, avg)": per_mode_curves["hybrid-svd"]["itc"],
         }
 
         out_png = OUT_DIR / f"itc_vs_ed_1d_L{L}_d{args.d:.2f}_reps{args.reps}.png"
@@ -307,17 +423,17 @@ def main() -> None:
 
         # Errors vs ED (avg)
         err_orig = compute_errors(per_mode_curves["original"]["itc"], per_mode_curves["original"]["ed"])
-        err_hyb = compute_errors(per_mode_curves["hybrid"]["itc"], per_mode_curves["original"]["ed"])
+        err_hyb = compute_errors(per_mode_curves["hybrid-svd"]["itc"], per_mode_curves["original"]["ed"])
 
         print(f"  original: rmse={err_orig.get('rmse', float('nan')):.3e} max_abs={err_orig.get('max_abs', float('nan')):.3e}")
-        print(f"  hybrid  : rmse={err_hyb.get('rmse', float('nan')):.3e} max_abs={err_hyb.get('max_abs', float('nan')):.3e}")
+        print(f"  hyb-svd : rmse={err_hyb.get('rmse', float('nan')):.3e} max_abs={err_hyb.get('max_abs', float('nan')):.3e}")
 
         results[str(L)] = {
             "L": L,
             "n": L,
             "params": {"dis": args.dis, "d": args.d, "reps": args.reps, "p0": args.p0, "method": args.method},
             "meta": per_mode_meta,
-            "errors": {"original_vs_ed": err_orig, "hybrid_vs_ed": err_hyb},
+            "errors": {"original_vs_ed": err_orig, "hybrid_svd_vs_ed": err_hyb},
             "plot": str(out_png),
         }
 

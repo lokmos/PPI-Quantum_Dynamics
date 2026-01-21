@@ -1,0 +1,70 @@
+{
+  "run_dir": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/oneclick_validate/20260121-003242",
+  "params": {
+    "dis": "random",
+    "method": "tensordot",
+    "d": 1.0,
+    "p": 0,
+    "cutoff": "1e-4",
+    "tol": "1e-8",
+    "force_steps": -1,
+    "lmax_hybrid": 6000.0,
+    "svd": {
+      "rank_h2": 64,
+      "rank_h4": 81,
+      "store_dtype": "float32",
+      "niter": 2,
+      "oversample": 16
+    }
+  },
+  "cases": [
+    {
+      "dim": 1,
+      "L": 9,
+      "original_h5": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/oneclick_validate/20260121-003242/dim1_L9/out_original/fermion/d1/data/random/PT/bck/O4/static/dataN9/tflow-d1.00-O4-x0.00-Jz0.10-p0.h5",
+      "hybrid_svd_h5": "/root/zyk/PPI/PPI-Quantum_Dynamics/test/oneclick_validate/20260121-003242/dim1_L9/out_hybrid_svd/fermion/d1/data/random/PT/bck/O4/static/dataN9/tflow-d1.00-O4-x0.00-Jz0.10-p0.h5",
+      "metrics_hybrid_minus_original": {
+        "H2_diag": {
+          "rmse": 4.8257644150643936e-08,
+          "max_abs": 3.0710953789787204e-07,
+          "mean_rel": 0.0006076987991801224,
+          "max_rel": 0.009454063104179119,
+          "n": 81.0
+        },
+        "Hint": {
+          "rmse": 1.524925735238402e-06,
+          "max_abs": 3.295970254754265e-05,
+          "mean_rel": 0.0012903615815261693,
+          "max_rel": 0.9320107341461709,
+          "n": 6561.0
+        },
+        "liom2": {
+          "rmse": 0.08007700895933505,
+          "max_abs": 0.20846896330041978,
+          "mean_rel": 1.6067672269937736,
+          "max_rel": 17.8771615332558,
+          "n": 81.0
+        },
+        "liom4": {
+          "rmse": 0.013874185305517216,
+          "max_abs": 0.0655404698732292,
+          "mean_rel": 6.480543490237954,
+          "max_rel": 3947.2021433625505,
+          "n": 6561.0
+        },
+        "trunc_err": {
+          "rmse": 0.0,
+          "max_abs": 0.0,
+          "mean_rel": 0.0,
+          "max_rel": 0.0,
+          "n": 4.0
+        },
+        "dl_list": {
+          "shape_mismatch": 1.0,
+          "a_len": 4625.0,
+          "b_len": 5000.0
+        }
+      }
+    }
+  ]
+}

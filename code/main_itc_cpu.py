@@ -30,6 +30,7 @@ and save the output as an HDF5 file containing various different datasets.
 """
 
 import os, sys
+from pathlib import Path
 from psutil import cpu_count
 # Set up threading options for parallel solver
 os.environ['OMP_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number of OpenMP threads to run in parallel
@@ -38,6 +39,10 @@ os.environ['KMP_DUPLICATE_LIB_OK']="TRUE"                         # Necessary on
 os.environ['KMP_WARNINGS'] = 'off'                                # Silence non-critical warning
 
 # JAX options - must be set BEFORE importing the JAX library
+# Allow opting into float64 via PYFLOW_ENABLE_X64=1
+if os.environ.get("PYFLOW_ENABLE_X64", "0") in ("1", "true", "True", "on", "ON", "yes", "YES"):
+    os.environ.setdefault("JAX_ENABLE_X64", "true")
+# else: keep JAX default (often float32)
 #os.environ['CUDA_VISIBLE_DEVICES'] = str(sys.argv[5])             # Set which device to use ('' is CPU)
 # os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 #os.environ['JAX_ENABLE_X64'] = 'true'                             # Enable 64-bit floats in JAX
@@ -51,6 +56,34 @@ import numpy as np
 from datetime import datetime
 import h5py,gc
 import core.diag as diag
+
+# -----------------------------------------------------------------------------
+# Optional: load "copy" diag routines (full hybrid implementation)
+# -----------------------------------------------------------------------------
+# The copy routine file uses relative imports, so we must load it as a submodule of
+# the `core.diag_routines` package. Keep this opt-in to preserve legacy behavior.
+if os.environ.get("PYFLOW_USE_COPY_ROUTINES", "0") in ("1", "true", "True", "on", "ON", "yes", "YES"):
+    try:
+        import importlib.util as _importlib_util
+        import sys as _sys
+
+        _copy_path = (Path(__file__).resolve().parent / "core" / "diag_routines" / "spinless_fermion copy.py").resolve()
+        _mod_name = "core.diag_routines.spinless_fermion_copy"
+        _spec = _importlib_util.spec_from_file_location(_mod_name, str(_copy_path))
+        if _spec is not None and _spec.loader is not None:
+            _mod = _importlib_util.module_from_spec(_spec)
+            _sys.modules[_mod_name] = _mod
+            _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
+            if hasattr(diag, "flow_static_int_recursive") and hasattr(_mod, "flow_static_int_recursive"):
+                diag.flow_static_int_recursive = _mod.flow_static_int_recursive  # type: ignore[attr-defined]
+            if hasattr(diag, "flow_static_int_hybrid") and hasattr(_mod, "flow_static_int_hybrid"):
+                diag.flow_static_int_hybrid = _mod.flow_static_int_hybrid  # type: ignore[attr-defined]
+            print(f"[COPY ROUTINES] Patched spinless fermion routines from: {_copy_path}", flush=True)
+        else:
+            print(f"[COPY ROUTINES] WARNING: failed to load spec for {_copy_path}", flush=True)
+    except Exception as _e:
+        print(f"[COPY ROUTINES] WARNING: patching failed: {type(_e).__name__}: {_e}", flush=True)
+
 import models.models as models
 import core.utility as utility
 from core.memlog import memlog, close as memlog_close
@@ -86,6 +119,16 @@ order = 4                       # Order of terms to keep in running Hamiltonian 
 # List of disorder strengths
 lmax =  1000                     # Flow time max
 qmax =  5000                     # Max number of flow time steps
+# Allow overriding the flow-time horizon / step budget from the environment.
+# This is useful for correctness benchmarking (e.g., make HYBRID converge by increasing lmax).
+try:
+    lmax = float(os.environ.get("PYFLOW_LMAX", str(lmax)))
+except Exception:
+    pass
+try:
+    qmax = int(os.environ.get("PYFLOW_QMAX", str(qmax)))
+except Exception:
+    pass
 #if dim == 2:
 #    lmax *= 2
 #    qmax *= 1.5
@@ -255,7 +298,8 @@ if __name__ == '__main__':
                         ncut = 6
 
                     # Diagonalise with ED (optional; requires QuSpin). Skipped by default for flow-only runs.
-                    if ED is not None and n <= ncut:
+                    _skip_ed = os.environ.get("PYFLOW_SKIP_ED", "0") in ("1", "true", "True", "on", "ON")
+                    if (not _skip_ed) and ED is not None and n <= ncut:
                         if dyn == True:
                             ed_startTime = datetime.now()
                             ed = ED(n, ham, tlist, dyn, imbalance)
@@ -270,7 +314,7 @@ if __name__ == '__main__':
                         ed = np.zeros(n)
                     print('Time after ED: ',datetime.now()-startTime)
 
-                    if (intr == False or n <= ncut) and ED is not None:
+                    if (not _skip_ed) and (intr == False or n <= ncut) and ED is not None:
                         if species == 'spinless fermion':
                             flevels = utility.flow_levels(n,flow,intr,order)
                         elif species == 'spinful fermion':
@@ -282,7 +326,7 @@ if __name__ == '__main__':
                         flevels=np.zeros(n)
                         ed=np.zeros(n)
 
-                    if (intr == False or n <= ncut) and ED is not None:
+                    if (not _skip_ed) and (intr == False or n <= ncut) and ED is not None:
                         lsr = utility.level_stat(flevels)
                         lsr2 = utility.level_stat(ed)
 
@@ -322,7 +366,7 @@ if __name__ == '__main__':
                             hf.create_dataset('H2_up',data=ham.H2_spinup)
                             hf.create_dataset('H2_dn',data=ham.H2_spindown)
 
-                        if ED is not None and n <= ncut:
+                        if (not _skip_ed) and ED is not None and n <= ncut:
                             hf.create_dataset('ed_runtime',data=str(ed_endTime))
                             hf.create_dataset('flevels', data = flevels,compression='gzip', compression_opts=9)
                             hf.create_dataset('ed', data = ed, compression='gzip', compression_opts=9)
@@ -355,7 +399,7 @@ if __name__ == '__main__':
                                     # hf.create_dataset('nt_list',data = flow["nt_list"])
                                     hf.create_dataset('itc',data=flow["itc"])
                                     hf.create_dataset('itc_nonint',data=flow["itc_nonint"])
-                                    if ED is not None and n <= ncut:
+                                    if (not _skip_ed) and ED is not None and n <= ncut:
                                         hf.create_dataset('ed_itc',data=ed_itc)
                                 # hf.create_dataset('inv',data=flow["Invariant"])
                         if dyn == True:

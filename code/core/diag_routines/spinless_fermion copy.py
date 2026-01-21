@@ -5206,6 +5206,21 @@ def hybrid_svd(A: np.ndarray, rank: int, oversample: int = 8, n_iter: int = 1, s
         if not np.all(np.isfinite(Ac)):
             Ac = np.nan_to_num(Ac, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Deterministic seeding (optional): useful for correctness validation / tuning.
+    # If caller doesn't provide a seed, we can pull a base seed from the environment.
+    # Use an internal counter so multiple calls don't reuse the same random matrix.
+    if seed is None:
+        s = os.environ.get("PYFLOW_HYBRID_SVD_SEED", "")
+        if s not in ("", "none", "None"):
+            try:
+                base = int(float(s))
+            except Exception:
+                base = None
+            if base is not None:
+                cnt = getattr(hybrid_svd, "_counter", 0)
+                setattr(hybrid_svd, "_counter", cnt + 1)
+                seed = base + cnt
+
     rng = np.random.default_rng(seed)
     Omega = rng.standard_normal(size=(n_, l)).astype(compute_dtype, copy=False)
 

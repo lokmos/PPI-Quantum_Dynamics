@@ -36,10 +36,42 @@ import numpy as np
 from sympy import prime
 import copy
 
+# -----------------------------------------------------------------------------
+# Reproducible RNG seeding (optional)
+# -----------------------------------------------------------------------------
+# Historically, `Hinit()` called `np.random.seed()` (no argument) on every call,
+# which makes outputs non-reproducible across separate process invocations.
+#
+# For correctness validation (e.g. original vs hybrid), we allow forcing a base
+# seed via env var `PYFLOW_SEED`. To avoid making multiple `Hinit()` calls
+# identical (e.g. spinful up/down), we deterministically offset the seed per call.
+_PYFLOW_SEED_CALL_ID = 0
+
+
+def _maybe_seed_numpy_for_hinit() -> None:
+    global _PYFLOW_SEED_CALL_ID
+    s = os.environ.get("PYFLOW_SEED", "")
+    if s in ("", "none", "None"):
+        # Preserve legacy behavior: non-deterministic per call.
+        np.random.seed()
+        return
+    try:
+        base = int(float(s))
+    except Exception:
+        # If parsing fails, fall back to legacy behavior.
+        np.random.seed()
+        return
+    seed = base + _PYFLOW_SEED_CALL_ID
+    _PYFLOW_SEED_CALL_ID += 1
+    np.random.seed(seed)
+    if _PYFLOW_SEED_CALL_ID == 1:
+        # Print once to keep logs readable.
+        print(f"[PYFLOW_SEED] base={base} (Hinit call seeds: base+0, base+1, ...)")
+
 def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
     """ Generate the non-interacting part of the Hamiltonian with the specified on-site potential. """
 
-    np.random.seed()
+    _maybe_seed_numpy_for_hinit()
     print('Choice of potential = %s' %dis_type)
 
     #-----------------------------------------------------------------

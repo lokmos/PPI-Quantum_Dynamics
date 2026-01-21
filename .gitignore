@@ -43,8 +43,7 @@ pyflow_out/
 # PDF files (documentation, papers)
 *.pdf
 
-# Images
-*.png
+
 
 # OS files
 .DS_Store
